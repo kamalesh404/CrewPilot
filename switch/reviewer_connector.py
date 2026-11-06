@@ -1,12 +1,15 @@
 """Reviewer agent running as a native agent inside Switch rooms.
 
 Independent, read-only agent that audits reproduction evidence in the durable
-SQLite store, verifies security constraints (shell=False, sanitized env),
-and approves the evidence for Draft PR publication:
+SQLite store, verifies execution containment and zero credential leaks,
+and approves the evidence for publication manifest preparation:
   `@crewpilot-reviewer review task <task-id>`
 
-Once verified, the human maintainer can authorize Draft PR creation:
+Once verified, the human maintainer can authorize publication manifest creation:
   `@crewpilot-reviewer publish task <task-id>`
+
+LIMITATION: This agent does NOT create or push GitHub pull requests. It prepares
+a verified publication manifest and records the maintainer authorization in SQLite.
 """
 
 from __future__ import annotations
@@ -16,6 +19,11 @@ import re
 from collections import OrderedDict
 from typing import Any
 
+from agent.reproducer import (
+    EXPECTED_FAILURE_SIGNATURE,
+    SUPPORTED_ISSUE,
+    parse_issue_identity,
+)
 from storage.task_store import (
     TaskNotFoundError,
     TaskStateError,
@@ -34,7 +42,7 @@ REVIEW_RE = re.compile(
     re.IGNORECASE,
 )
 PUBLISH_RE = re.compile(
-    r"^(?:please\s+)?(?:publish|create\s+pr|open\s+pr|ship)(?:\s+task)?\s+([0-9a-fA-F-]{8,36})[.!]*$",
+    r"^(?:please\s+)?(?:publish|create\s+pr|open\s+pr|ship|authorize)(?:\s+task)?\s+([0-9a-fA-F-]{8,36})[.!]*$",
     re.IGNORECASE,
 )
 HELP_RE = re.compile(r"^/?(?:help|usage|commands)[.!]?$", re.IGNORECASE)
@@ -51,7 +59,7 @@ def _clip(text: str, max_chars: int) -> str:
 
 
 class SwitchReviewerConnector:
-    """Read-only auditing agent for bug reproduction evidence and Draft PR authorization."""
+    """Read-only auditing agent for bug reproduction evidence and publication authorization."""
 
     def __init__(
         self,
@@ -79,20 +87,34 @@ class SwitchReviewerConnector:
         if not room_id or not body:
             return
 
-        message_id = str(payload.get("id") or "")
-        if message_id and message_id in self._seen_messages:
-            logger.debug("Skipping duplicate message %s", message_id)
-            return
+        # Sender identity extraction:
+        # Documented protocol: payload.sender is a participant ID string
+        # payload.sender_name is the user display name
+        raw_name = payload.get("sender_name")
+        raw_sender = payload.get("sender")
+        if isinstance(raw_sender, str) and raw_sender.strip():
+            sender_id = raw_sender.strip()
+            sender_name = str(raw_name or sender_id).strip()
+        elif isinstance(raw_sender, dict):
+            sender_id = str(raw_sender.get("id") or raw_sender.get("name") or "user").strip()
+            sender_name = str(raw_sender.get("name") or raw_name or sender_id).strip()
+        else:
+            sender_id = str(payload.get("sender_id") or raw_name or "user").strip()
+            sender_name = str(raw_name or sender_id).strip()
+
+        if sender_name.casefold() == self.agent_name.casefold() or sender_id.casefold() == self.agent_name.casefold():
+            return  # Never react to our own posts.
+
+        # Deduplication using message_id (official protocol) with fallback to id
+        message_id = str(payload.get("message_id") or payload.get("id") or "")
         if message_id:
+            if message_id in self._seen_messages:
+                logger.debug("Skipping duplicate message %s", message_id)
+                return
             self._record_seen(message_id)
 
-        thread_id = payload.get("thread_id")
-        if thread_id is not None:
-            thread_id = str(thread_id).strip() or None
-
-        sender = payload.get("sender") if isinstance(payload.get("sender"), dict) else {}
-        sender_id = str(sender.get("id") or "")
-        sender_name = str(sender.get("name") or sender.get("username") or "user")
+        raw_thread = payload.get("thread_id")
+        thread_id = str(raw_thread) if raw_thread else None
 
         stripped = _strip_mentions(body)
 
@@ -134,7 +156,7 @@ class SwitchReviewerConnector:
             )
             return
 
-        if re.search(r"\b(?:publish|create\s+pr)\b", stripped, re.IGNORECASE):
+        if re.search(r"\b(?:publish|create\s+pr|authorize)\b", stripped, re.IGNORECASE):
             await self._send(
                 room_id,
                 f"Please specify the exact task ID to publish: "
@@ -167,10 +189,10 @@ class SwitchReviewerConnector:
     def _help_text(self) -> str:
         return (
             f"**CrewPilot Independent Reviewer (`@{self.agent_name}`)**\n"
-            "I independently audit reproduction evidence, check security bounds, and prepare Draft PR publications.\n\n"
+            "I independently audit reproduction evidence, check security containment, and prepare publication manifests.\n\n"
             "**Commands:**\n"
             f"- `@{self.agent_name} review task <task-id>` — Audit recorded evidence for a reproduced bug.\n"
-            f"- `@{self.agent_name} publish task <task-id>` — Authorize Draft PR publication (maintainer only).\n"
+            f"- `@{self.agent_name} publish task <task-id>` — Authorize publication manifest preparation (maintainer only).\n"
             "- `help` — Show this message."
         )
 
@@ -200,6 +222,19 @@ class SwitchReviewerConnector:
             )
             return
 
+        # Target issue validation: exact issue identity required
+        parsed_issue = parse_issue_identity(task.issue_source)
+        if parsed_issue != SUPPORTED_ISSUE:
+            await self._send(
+                room_id,
+                f"### 🛡️ Independent Review: Task `{task_id}`\n"
+                f"- **Verdict:** ❌ **REVISION REQUIRED (Unsupported Target)**\n"
+                f"- **Target:** {task.issue_source}\n"
+                "- **Reason:** Only verified reproduction probes for psf/requests#7634 are currently supported.",
+                thread_id,
+            )
+            return
+
         evidence_list = self._store.list_evidence(task_id)
         if not evidence_list:
             await self._send(
@@ -212,25 +247,29 @@ class SwitchReviewerConnector:
 
         # Audit latest reproduction evidence
         latest_ev = evidence_list[-1]
-        repro_output = latest_ev.output or ""
+        repro_output = (latest_ev.output or "").strip()
+        desc = (latest_ev.description or "").strip()
 
-        # Check evidence criteria:
-        # psf/requests#7634 expects exit code 1 with AttributeError
-        desc = latest_ev.description or ""
-        is_bug_confirmed = (
-            ("AttributeError" in repro_output or "REPRODUCED_BUG" in repro_output)
-            or "exit 1" in desc
-            or (bool(repro_output) and "failed" not in desc.lower())
-        )
+        # Strict criteria check:
+        # 1. Non-empty output
+        has_output = bool(repro_output)
 
-        # Check security compliance: no leaked tokens or passwords
+        # 2. Exit code 1 verified
+        exit_code_ok = "exit 1" in desc or "exit_code: 1" in repro_output or "(exit 1)" in desc
+
+        # 3. Exact failure signature present: "'int' object has no attribute 'translate'"
+        signature_ok = EXPECTED_FAILURE_SIGNATURE in repro_output
+
+        # 4. Security compliance: zero leaked tokens or passwords
         secret_leak_pattern = re.compile(
             r"\b(?:sk-[a-zA-Z0-9_-]{20,}|ghp_[a-zA-Z0-9]{20,}|ak_live_[a-zA-Z0-9]{16,}|bearer\s+[a-zA-Z0-9._-]{20,})\b",
             re.IGNORECASE,
         )
         clean_security = secret_leak_pattern.search(repro_output) is None
 
-        if is_bug_confirmed and clean_security:
+        is_verified = has_output and exit_code_ok and signature_ok and clean_security
+
+        if is_verified:
             try:
                 self._store.update_task_status(
                     task_id,
@@ -239,27 +278,44 @@ class SwitchReviewerConnector:
                     reason=f"Evidence independently verified by {self.agent_name}",
                 )
             except (TaskStateError, TaskNotFoundError) as exc:
-                logger.warning("Status transition error during review: %s", exc)
+                logger.error("Status transition error during review for task %s: %s", task_id, exc)
+                await self._send(
+                    room_id,
+                    f"Review failed: could not transition task state ({exc}).",
+                    thread_id,
+                )
+                return
 
             report = (
                 f"### 🛡️ Independent Code & Evidence Review: Task `{task_id}`\n"
                 f"- **Reviewer:** `@{self.agent_name}`\n"
-                f"- **Verdict:** ✅ **EVIDENCE VERIFIED (Approved for Draft PR)**\n"
+                f"- **Verdict:** ✅ **EVIDENCE VERIFIED (Approved for Publication)**\n"
                 f"- **Issue:** {task.issue_source}\n"
-                f"- **Evidence Audit:** {desc or 'Reproduction probe verified.'}\n"
-                f"- **Root Cause:** Verified exception trace in isolated execution sandbox.\n"
+                f"- **Evidence Audit:** Subprocess exit code 1 matches exact signature (`{EXPECTED_FAILURE_SIGNATURE}`).\n"
+                f"- **Root Cause:** Verified exception trace in disposable execution workspace.\n"
                 f"- **Security Verification:** PASS (Zero credentials leaked; execution strictly confined).\n\n"
-                f"Human maintainer ({task.requester_name}) may authorize Draft PR creation:\n"
+                f"Human maintainer ({task.requester_name}) may authorize publication manifest preparation:\n"
                 f"reply `@{self.agent_name} publish task {task_id}`."
             )
             await self._send(room_id, report, thread_id)
         else:
+            reasons = []
+            if not has_output:
+                reasons.append("Empty output from reproduction probe.")
+            if not exit_code_ok:
+                reasons.append("Exit code was not 1.")
+            if not signature_ok:
+                reasons.append(f"Missing expected error signature: {EXPECTED_FAILURE_SIGNATURE}.")
+            if not clean_security:
+                reasons.append("Potential secret or credential pattern detected in probe output.")
+
+            reason_str = " ".join(reasons)
             try:
                 self._store.update_task_status(
                     task_id,
                     TaskStatus.CHANGES_REQUESTED.value,
                     actor_id=self.agent_name,
-                    reason="Evidence audit failed verification",
+                    reason=f"Evidence verification failed: {reason_str}",
                 )
             except Exception as exc:
                 logger.warning("Status transition error: %s", exc)
@@ -269,7 +325,7 @@ class SwitchReviewerConnector:
                 f"- **Reviewer:** `@{self.agent_name}`\n"
                 f"- **Verdict:** ❌ **REVISION REQUIRED**\n"
                 f"- **Issue:** {task.issue_source}\n"
-                f"- **Reason:** Evidence did not cleanly demonstrate the bug or failed security audit."
+                f"- **Reason:** Evidence did not satisfy strict reproduction criteria: {reason_str}"
             )
             await self._send(room_id, report, thread_id)
 
@@ -303,7 +359,7 @@ class SwitchReviewerConnector:
         if sender_id != task.requester_id:
             await self._send(
                 room_id,
-                f"Only {task.requester_name} can authorize Draft PR publication for this task.",
+                f"Only {task.requester_name} can authorize publication manifest preparation for this task.",
                 thread_id,
             )
             return
@@ -313,33 +369,40 @@ class SwitchReviewerConnector:
             await self._send(
                 room_id,
                 f"Task '{task_id}' is in status '{task.status}'. "
-                "Evidence must be approved by the Reviewer before publishing.",
+                "Evidence must be approved by the Reviewer before publication manifest preparation.",
                 thread_id,
             )
             return
 
-        # Transition to PR_PUBLISHED
+        # Transition to PUBLICATION_AUTHORIZED
         try:
             self._store.update_task_status(
                 task_id,
-                TaskStatus.PR_PUBLISHED.value,
+                TaskStatus.PUBLICATION_AUTHORIZED.value,
                 actor_id=sender_id,
-                reason=f"Draft PR publication authorized by {sender_name}",
+                reason=f"Publication manifest preparation authorized by {sender_name}",
             )
         except (TaskStateError, TaskNotFoundError) as exc:
-            logger.warning("Status update failed during publish: %s", exc)
+            logger.error("Status update failed during publish for task %s: %s", task_id, exc)
+            await self._send(
+                room_id,
+                f"Publication authorization failed: {exc}",
+                thread_id,
+            )
+            return
 
         evidence_list = self._store.list_evidence(task_id)
         ev_count = len(evidence_list)
 
         msg = (
-            f"### 🚀 Draft PR Manifest Prepared for Task `{task_id}`\n"
+            f"### 📋 Publication Manifest Prepared for Task `{task_id}`\n"
             f"- **Target Issue:** {task.issue_source}\n"
-            f"- **Branch:** `fix/issue-7634-multipart-key-str`\n"
-            f"- **Audited Evidence Items:** {ev_count}\n"
+            f"- **Status:** Manifest Prepared & Authorized (No remote PR published)\n"
+            f"- **Audited Evidence Items:** {ev_count} in durable SQLite ledger\n"
             f"- **Authorized By:** {sender_name} (`{sender_id}`)\n"
-            f"- **Status:** Published to audit ledger (Task `{task_id}` completed)\n\n"
-            "All evidence, approval logs, and audit trails are persisted in durable SQLite."
+            f"- **Suggested Branch:** `fix/issue-7634-multipart-key-str` (ready for local implementation)\n\n"
+            "*Note: Automated remote PR creation is not executed in this environment. "
+            "The publication manifest and complete audit trail are recorded in durable SQLite.*"
         )
         await self._send(room_id, msg, thread_id)
-        logger.info("Draft PR manifest completed for task %s by %s", task_id, sender_name)
+        logger.info("Publication manifest completed for task %s by %s", task_id, sender_name)

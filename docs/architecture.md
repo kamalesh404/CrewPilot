@@ -70,8 +70,8 @@ sequenceDiagram
     Human->>Switch: "@crewpilot-reviewer publish task <task-id>"
     Switch->>Reviewer: Validated publication trigger from authorized requester
     Reviewer->>DB: Verify all gates (approved scope, verified evidence, requester match)
-    Reviewer->>DB: Transition status -> pr_published
-    Reviewer->>Switch: Post Draft PR manifest and audit summary to room
+    Reviewer->>DB: Transition status -> publication_authorized
+    Reviewer->>Switch: Post Publication Manifest and audit summary to room
 ```
 
 ---
@@ -81,9 +81,9 @@ sequenceDiagram
 | Agent Identity | Switch Permissions | Local Capabilities | Secrets Access | Network Access |
 | :--- | :--- | :--- | :--- | :--- |
 | **`crewpilot-triager`** | Public room messaging, read context | Issue parsing, LLM completion, task initialization in SQLite | LLM API key, Switch credentials | GitHub Issue API (Read-only), LLM provider |
-| **`crewpilot-repro-builder`** | Room messaging, targeted messaging to Triager/Reviewer | Disposable sandbox execution, subprocess runner (`shell=False`) | **Zero secrets.** No GitHub token, no Switch API key in sandbox | Stripped environment; no outbound secrets |
+| **`crewpilot-repro-builder`** | Room messaging, targeted messaging to Triager/Reviewer | Credential-reduced disposable workspace execution, subprocess runner (`shell=False`) | **Zero secrets.** No GitHub token, no Switch API key in workspace | Stripped environment; no outbound secrets |
 | **`crewpilot-reviewer`** | Room messaging, targeted messaging to Builder | Read-only evidence inspection, policy & security check | Switch credentials only (No LLM key required) | Internal SQLite state reading |
-| **`Draft PR Publisher`** | Authorized by Reviewer on maintainer command | Draft PR manifest creation, audit finalization | Scoped GitHub fine-grained token (`contents:write`, `pull_requests:write`) | GitHub API & Git remote push only |
+| **`Publication Authorizer`** | Authorized by Reviewer on maintainer command | Publication manifest creation, audit finalization | No remote GitHub write tokens in default mode | Local manifest & audit finalization |
 
 ---
 
@@ -104,7 +104,7 @@ changes_requested -> awaiting_approval | cancelled
 approved          -> reproducing | cancelled
 reproducing       -> under_review | changes_requested | cancelled
 under_review      -> review_approved | changes_requested | cancelled
-review_approved   -> pr_published | cancelled
+review_approved   -> publication_authorized | cancelled
 ```
 
 ---
@@ -112,7 +112,10 @@ review_approved   -> pr_published | cancelled
 ## 5. Security & Isolation Invariants
 
 1. **Subprocess Isolation:** The Reproducer runs strictly through explicit argument vectors (`subprocess.run([sys.executable, probe_path], shell=False)`). No interpolated shell strings are ever executed.
-2. **Environment Sanitization:** Subprocesses inherit a sanitized environment blocklist stripping all variables matching `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `AUTH`, `CREDENTIAL`, etc.
-3. **No Credential Leakage:** Reviewer performs automated audit pattern scanning (`SECRET_LEAK_RE`) over all captured evidence before approving.
-4. **Draft PR Ceiling:** The automated squad can **only** produce a GitHub Draft PR. It cannot merge, close issues, push to default branches, or trigger production releases.
-5. **Exact Human Authorization:** Only the original requester (`task.requester_id`) can approve triage or authorize Draft PR publication. Room-level fallbacks are strictly prohibited.
+2. **Environment Sanitization & Credential Reduction:** Subprocesses inherit a sanitized environment blocklist stripping all variables matching `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `AUTH`, `CREDENTIAL`, etc.
+3. **Execution Containment Boundary & Limitations:**
+   - Probes execute in a dedicated, disposable temporary directory (`tempfile.mkdtemp(prefix="crewpilot-task-")`), and probe scripts/evidence are persisted to `.evidence/task-<id>/`.
+   - **Current Limitation:** Subprocesses run with the local user's OS permissions without container-level kernel namespaces, cgroups, or network sandboxing (e.g., Docker, Bubblewrap, or gVisor). Untrusted code could inspect accessible host filesystem paths. Full containerization is a documented production roadmap milestone.
+4. **No Credential Leakage:** Reviewer performs automated audit pattern scanning (`SECRET_LEAK_RE`) over all captured evidence before approving.
+5. **No False Remote Mutations:** To prevent unauthorized Git repository pollution, automated squad execution concludes with a verified local Publication Manifest (`publication_authorized`) in durable SQLite. Automated remote PR creation is fail-safe disabled.
+6. **Exact Human Authorization:** Only the original requester (`task.requester_id`) can approve triage or authorize publication manifest preparation. Room-level fallbacks are strictly prohibited.

@@ -26,13 +26,17 @@ import time
 from pathlib import Path
 from typing import Any
 
-from agent.triage_agent import TriageResult
-from storage.task_store import TaskStatus, TaskStore
-from switch.repro_connector import SwitchReproConnector
-from switch.reviewer_connector import SwitchReviewerConnector
-from switch.switch_connector import SwitchTriageConnector
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from agent.triage_agent import TriageResult  # noqa: E402
+from github_issues import IssueInput  # noqa: E402
+from storage.task_store import TaskStatus, TaskStore  # noqa: E402
+from switch import switch_connector  # noqa: E402
+from switch.repro_connector import SwitchReproConnector  # noqa: E402
+from switch.reviewer_connector import SwitchReviewerConnector  # noqa: E402
+from switch.switch_connector import SwitchTriageConnector  # noqa: E402
 
 
 class DemoSwitchClient:
@@ -133,20 +137,35 @@ async def run_demo() -> None:
     maintainer_id = "maintainer-vincenzo"
     maintainer_name = "Vincenzo"
 
+    # Hermetic mock of GitHub issue loading to avoid remote API rate limits/timeouts during demo
+    async def demo_load_issue(raw: str, token: str | None = None) -> IssueInput:
+        return IssueInput(
+            text=(
+                "When preparing a multipart request with files, non-string form field names "
+                "in `data` cause an AttributeError ('int' object has no attribute 'translate') "
+                "in urllib3/fields.py."
+            ),
+            source="psf/requests#7634",
+        )
+
+    switch_connector.load_issue = demo_load_issue  # type: ignore[assignment]
+
     print("\n>>> STEP 1: Maintainer reports issue in Switch room")
     print(
         f"[{maintainer_name}] @crewpilot-triager triage https://github.com/psf/requests/issues/7634"
     )
+    # Documented official Switch message payload: string sender, separate sender_name, message_id
     await triager.handle_event(
         {
             "type": "message",
             "room_id": room,
             "payload": {
-                "id": "msg-01",
+                "message_id": "msg-01",
                 "body": "@crewpilot-triager triage https://github.com/psf/requests/issues/7634",
                 "addressed": True,
                 "thread_id": thread,
-                "sender": {"id": maintainer_id, "name": maintainer_name},
+                "sender": maintainer_id,
+                "sender_name": maintainer_name,
             },
         }
     )
@@ -164,11 +183,12 @@ async def run_demo() -> None:
             "type": "message",
             "room_id": room,
             "payload": {
-                "id": "msg-02",
+                "message_id": "msg-02",
                 "body": f"@crewpilot-triager approve task {task_id}",
                 "addressed": True,
                 "thread_id": thread,
-                "sender": {"id": maintainer_id, "name": maintainer_name},
+                "sender": maintainer_id,
+                "sender_name": maintainer_name,
             },
         }
     )
@@ -185,11 +205,12 @@ async def run_demo() -> None:
             "type": "message",
             "room_id": room,
             "payload": {
-                "id": "msg-03",
+                "message_id": "msg-03",
                 "body": triager_handoff,
                 "addressed": True,
                 "thread_id": thread,
-                "sender": {"id": "crewpilot-triager", "name": "Triager"},
+                "sender": "crewpilot-triager",
+                "sender_name": "Triager",
             },
         }
     )
@@ -206,27 +227,29 @@ async def run_demo() -> None:
             "type": "message",
             "room_id": room,
             "payload": {
-                "id": "msg-04",
+                "message_id": "msg-04",
                 "body": repro_handoff,
                 "addressed": True,
                 "thread_id": thread,
-                "sender": {"id": "crewpilot-repro-builder", "name": "Builder"},
+                "sender": "crewpilot-repro-builder",
+                "sender_name": "Builder",
             },
         }
     )
 
-    print("\n>>> STEP 5: Maintainer authorizes Draft PR publication")
+    print("\n>>> STEP 5: Maintainer authorizes publication manifest preparation")
     print(f"[{maintainer_name}] @crewpilot-reviewer publish task {task_id}")
     await reviewer.handle_event(
         {
             "type": "message",
             "room_id": room,
             "payload": {
-                "id": "msg-05",
+                "message_id": "msg-05",
                 "body": f"@crewpilot-reviewer publish task {task_id}",
                 "addressed": True,
                 "thread_id": thread,
-                "sender": {"id": maintainer_id, "name": maintainer_name},
+                "sender": maintainer_id,
+                "sender_name": maintainer_name,
             },
         }
     )
@@ -238,13 +261,16 @@ async def run_demo() -> None:
     final_task = store.get_task(task_id)
     assert final_task is not None
     print(f"Final Task Status: {final_task.status}")
-    assert final_task.status == TaskStatus.PR_PUBLISHED.value
+    assert final_task.status == TaskStatus.PUBLICATION_AUTHORIZED.value
 
     evidence = store.list_evidence(task_id)
     print(f"Audited Evidence Items: {len(evidence)}")
     for ev in evidence:
         print(f"  - [{ev.evidence_type}] {ev.description}")
         print(f"    Command: {ev.command}")
+        if ev.artifact_path:
+            artifact_exists = Path(ev.artifact_path).exists()
+            print(f"    Artifact on disk: {ev.artifact_path} (Exists: {artifact_exists})")
 
     approvals = store.list_approvals(task_id)
     print(f"Recorded Approvals: {len(approvals)}")

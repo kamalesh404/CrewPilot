@@ -3,10 +3,13 @@
 Listens for handoffs from the Triager (or direct maintainer requests):
   `@crewpilot-repro-builder reproduce task <task-id>`
 
-Executes reproduction in an isolated sandbox with sanitized environment
-(no secrets/tokens leaked, shell=False, strict timeouts), saves evidence
-to the durable SQLite store, and hands off to the Reviewer:
+Executes reproduction in a credential-reduced subprocess execution environment
+in a disposable temporary workspace (no host secrets/tokens leaked, shell=False,
+strict timeouts), saves persistent evidence to the durable SQLite store and .evidence/,
+and hands off to the Reviewer:
   `@crewpilot-reviewer review task <task-id>`
+
+LIMITATION: OS-level / container isolation is not currently implemented.
 """
 
 from __future__ import annotations
@@ -85,20 +88,34 @@ class SwitchReproConnector:
         if not room_id or not body:
             return
 
-        message_id = str(payload.get("id") or "")
-        if message_id and message_id in self._seen_messages:
-            logger.debug("Skipping duplicate message %s", message_id)
-            return
+        # Sender identity extraction:
+        # Documented protocol: payload.sender is a participant ID string
+        # payload.sender_name is the user display name
+        raw_name = payload.get("sender_name")
+        raw_sender = payload.get("sender")
+        if isinstance(raw_sender, str) and raw_sender.strip():
+            sender_id = raw_sender.strip()
+            sender_name = str(raw_name or sender_id).strip()
+        elif isinstance(raw_sender, dict):
+            sender_id = str(raw_sender.get("id") or raw_sender.get("name") or "user").strip()
+            sender_name = str(raw_sender.get("name") or raw_name or sender_id).strip()
+        else:
+            sender_id = str(payload.get("sender_id") or raw_name or "user").strip()
+            sender_name = str(raw_name or sender_id).strip()
+
+        if sender_name.casefold() == self.agent_name.casefold() or sender_id.casefold() == self.agent_name.casefold():
+            return  # Never react to our own posts.
+
+        # Deduplication using message_id (official protocol) with fallback to id
+        message_id = str(payload.get("message_id") or payload.get("id") or "")
         if message_id:
+            if message_id in self._seen_messages:
+                logger.debug("Skipping duplicate message %s", message_id)
+                return
             self._record_seen(message_id)
 
-        thread_id = payload.get("thread_id")
-        if thread_id is not None:
-            thread_id = str(thread_id).strip() or None
-
-        sender = payload.get("sender") if isinstance(payload.get("sender"), dict) else {}
-        sender_id = str(sender.get("id") or "")
-        sender_name = str(sender.get("name") or sender.get("username") or "user")
+        raw_thread = payload.get("thread_id")
+        thread_id = str(raw_thread) if raw_thread else None
 
         stripped = _strip_mentions(body)
 
@@ -163,7 +180,7 @@ class SwitchReproConnector:
     def _help_text(self) -> str:
         return (
             f"**CrewPilot Reproducer / Builder (`@{self.agent_name}`)**\n"
-            "I execute isolated bug reproduction probes in a secure, credential-stripped sandbox.\n\n"
+            "I execute isolated bug reproduction probes in a credential-reduced temporary workspace.\n\n"
             "**Commands:**\n"
             f"- `@{self.agent_name} reproduce task <task-id>` — Run reproduction probe for an approved task.\n"
             f"- `@{self.agent_name} status task <task-id>` — View task evidence and status.\n"
@@ -253,7 +270,7 @@ class SwitchReproConnector:
         await self._send(
             room_id,
             f"🔬 Reproducing bug for task `{task_id}` ({task.issue_source}) "
-            "in isolated sandbox environment (shell=False, stripped credentials)...",
+            "in disposable workspace (credential-reduced subprocess execution, shell=False)...",
             thread_id,
         )
 
@@ -264,15 +281,15 @@ class SwitchReproConnector:
                 issue_source=task.issue_source,
             )
         except Exception as exc:
-            logger.exception("Reproduction sandbox crashed for task %s", task_id)
+            logger.exception("Reproduction execution crashed for task %s", task_id)
             await self._send(
                 room_id,
-                f"Reproduction sandbox encountered an error: {_clip(str(exc), MAX_ERROR_CHARS)}",
+                f"Reproduction execution encountered an error: {_clip(str(exc), MAX_ERROR_CHARS)}",
                 thread_id,
             )
             return
 
-        # Persist evidence in durable SQLite store
+        # Persist evidence in durable SQLite store with persistent artifact path
         self._store.add_evidence(
             task_id=task_id,
             evidence_type="reproduction_probe",

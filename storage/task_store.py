@@ -31,7 +31,9 @@ class TaskStatus(str, Enum):
     IMPLEMENTING = "implementing"
     UNDER_REVIEW = "under_review"
     REVIEW_APPROVED = "review_approved"
-    PR_PUBLISHED = "pr_published"
+    PUBLICATION_AUTHORIZED = "publication_authorized"
+    # Backward-compatible alias
+    PR_PUBLISHED = "publication_authorized"
 
 
 class DecisionType(str, Enum):
@@ -70,10 +72,10 @@ VALID_TRANSITIONS: dict[str, set[str]] = {
         TaskStatus.CANCELLED.value,
     },
     TaskStatus.REVIEW_APPROVED.value: {
-        TaskStatus.PR_PUBLISHED.value,
+        TaskStatus.PUBLICATION_AUTHORIZED.value,
         TaskStatus.CANCELLED.value,
     },
-    TaskStatus.PR_PUBLISHED.value: set(),
+    TaskStatus.PUBLICATION_AUTHORIZED.value: set(),
     TaskStatus.CANCELLED.value: set(),
 }
 

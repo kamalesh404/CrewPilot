@@ -50,10 +50,11 @@ Only the original requester is authorized to approve:
 Switch delivers the handoff to `@crewpilot-repro-builder`.
 **Reproducer Agent Action:**
 - Verifies task status is `approved` in SQLite.
-- Spawns an isolated temporary workspace with stripped credentials (zero API keys, tokens, or passwords leaked).
+- Spawns a disposable temporary workspace with credential reduction (`shell=False`, environment sanitization).
+  *(Note: This provides credential stripping and workspace path isolation; OS kernel containerization is documented as a roadmap item.)*
 - Executes reproduction probe with explicit argument arrays (`shell=False`) under a strict timeout.
 - Captures exact evidence: exit code `1`, `AttributeError: 'int' object has no attribute 'translate'` inside `urllib3.fields.format_multipart_header_param`.
-- Stores evidence artifact in SQLite TaskStore.
+- Stores evidence artifact in SQLite TaskStore and persists probe script, logs, and `metadata.json` on disk in `.evidence/task-<id>/`.
 - Transitions task status to `under_review`.
 - Posts evidence report to Switch room and hands off to Reviewer:
   ```text
@@ -64,7 +65,7 @@ Switch delivers the handoff to `@crewpilot-repro-builder`.
 Switch delivers the handoff to `@crewpilot-reviewer`.
 **Reviewer Agent Action:**
 - Read-only inspection of the task's evidence and audit ledger in SQLite.
-- Verifies exit code `1` matches the reported failure mode.
+- Verifies exit code `1` matches the reported failure mode and exact signature `'int' object has no attribute 'translate'`.
 - Audits output for absence of leaked credentials or host secrets.
 - Verifies execution containment.
 - Transitions task status to `review_approved`.
@@ -72,20 +73,21 @@ Switch delivers the handoff to `@crewpilot-reviewer`.
   ```text
   ### 🛡️ Independent Code & Evidence Review: Task `<task-id>`
   - Reviewer: @crewpilot-reviewer
-  - Verdict: ✅ EVIDENCE VERIFIED (Approved for Draft PR)
+  - Verdict: ✅ EVIDENCE VERIFIED (Approved for Publication)
   - Security Verification: PASS (Zero credentials leaked; execution strictly confined)
   ```
-- Prompts maintainer: `reply @crewpilot-reviewer publish task <task-id>` to publish Draft PR.
+- Prompts maintainer: `reply @crewpilot-reviewer publish task <task-id>` to authorize publication manifest preparation.
 
-### Step 5: Maintainer Authorizes Draft PR Publication
+### Step 5: Maintainer Authorizes Publication Manifest Preparation
 Maintainer authorizes publication:
 ```text
 @crewpilot-reviewer publish task <task-id>
 ```
 **Reviewer Agent Response:**
 - Verifies requester authorization and `review_approved` task state.
-- Transitions task status to `pr_published`.
-- Generates Draft PR manifest for branch `fix/issue-7634-multipart-key-str` with full audit ledger.
+- Transitions task status to `publication_authorized`.
+- Generates Publication Manifest for branch `fix/issue-7634-multipart-key-str` with full audit ledger.
+  *(Note: To prevent unauthorized remote mutations, automated remote PR creation is not performed; the verified manifest and audit trail are finalized in SQLite and on disk).*
 - Finalizes task with 7 immutable audit log records.
 
 ---
@@ -97,7 +99,7 @@ To run the complete verified simulation in 5 seconds:
 python demo/simulate_squad_demo.py
 ```
 
-To run with live Switch servers:
+To run with live Switch servers (see `docs/live-switch-verification.md` for prerequisites):
 ```bash
 # 1. Register the 3 squad agents
 python -m switch.register_agent --role squad

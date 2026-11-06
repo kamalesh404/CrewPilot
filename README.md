@@ -5,18 +5,36 @@
 
 CrewPilot is an autonomous, evidence-driven bug investigation squad operating directly inside team chat via **[Switch](https://github.com/sandbox-quantum/switch)**.
 
-Instead of human maintainers manually diagnosing, reproducing, and auditing bug reports, CrewPilot deploys **three genuinely independent Switch agents** that collaborate with a human engineer in a shared Switch room (mirrored to Discord or Slack):
+---
 
-1. **`@crewpilot-triager`**: Ingests GitHub issues, extracts structured diagnostics (severity, category, difficulty), writes a fix plan, and binds human maintainer scope approval.
-2. **`@crewpilot-repro-builder`**: Receives an addressed Switch handoff, spawns an isolated subprocess sandbox (`shell=False`, stripped credentials), executes a reproduction probe against real bugs (e.g. `psf/requests#7634`), captures empirical evidence (exit codes, stack traces), and attaches artifacts to a durable SQLite ledger.
-3. **`@crewpilot-reviewer`**: An independent, read-only agent that audits the captured evidence, verifies execution containment, scans for leaked credentials, and prompts the maintainer for Draft PR publication.
+## 1. The Problem
+
+Software engineering teams and open-source maintainers lose countless hours context-switching to investigate ambiguous bug reports. Incoming issues frequently lack reproduction scripts, precise environmental details, or verified failure traces. Maintainers must manually configure isolated environments, reproduce errors, and verify fixes before writing code.
 
 ---
 
-## Architecture & Switch Collaboration Flow
+## 2. The Solution: Three Role-Specific Switch Identities
+
+Instead of monolithic prompts pretending to be multiple people, CrewPilot deploys **three genuinely independent Switch agent identities** that collaborate with a human engineer in a shared Switch room (mirrored to Discord, Slack, or Mattermost):
+
+1. **`@crewpilot-triager`**:
+   - Ingests issue reports and fetches issue text via GitHub API.
+   - Generates structured diagnostics (severity, category, difficulty) and a targeted fix plan.
+   - Records the task in durable SQLite and binds scope approval to the originating human maintainer.
+2. **`@crewpilot-repro-builder`**:
+   - Receives an addressed handoff message from the Triager through Switch.
+   - Executes an empirical reproduction probe against real bugs (e.g. `psf/requests#7634`) in a disposable workspace with credential reduction.
+   - Captures empirical evidence (exact failure traceback, exit code 1), attaches artifacts to a durable SQLite ledger, and saves disk artifacts in `.evidence/task-<id>/`.
+3. **`@crewpilot-reviewer`**:
+   - An independent, read-only auditor that inspects captured evidence, verifies exit code matching and exact error signatures, and checks for leaked secrets.
+   - Prompts the human maintainer for publication authorization and prepares the verified Publication Manifest.
+
+---
+
+## 3. Architecture & Switch Collaboration Flow
 
 ```text
-Team Chat (Discord / Slack)
+Team Chat (Discord / Slack / Mattermost)
          │
          │  addressed messages & threads
          ▼
@@ -34,7 +52,7 @@ Switch Platform (Discord Bridge / Room Gateway)
 │              │                                                         │
 │              ▼  [Human Scope Approval: "approve task <id>"]            │
 │   ┌───────────────────────┐                                            │
-│   │@crewpilot-repro-builder│ ── 2. Isolated Probe & Evidence Capture   │
+│   │@crewpilot-repro-builder│ ── 2. Probe Execution & Evidence Capture   │
 │   └──────────┬────────────┘                                            │
 │              │                                                         │
 │              ▼  [Switch Handoff: "review task <id>"]                   │
@@ -44,128 +62,206 @@ Switch Platform (Discord Bridge / Room Gateway)
 │              │                                                         │
 │              ▼  [Human Publication Auth: "publish task <id>"]          │
 │   ┌───────────────────────┐                                            │
-│   │   Draft PR Manifest   │ ── 4. Branch & PR Manifest Finalization    │
+│   │ Publication Manifest  │ ── 4. Branch & Audit Manifest Finalization │
 │   └───────────────────────┘                                            │
 │                                                                        │
 │   Durable SQLite TaskStore (tasks, evidence, approvals, audit ledger)  │
+│   Disk Evidence Storage    (.evidence/task-<id>/)                      │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Why Switch is Essential
 - **True Agent-to-Agent Handoffs:** Agents do not communicate via in-memory function calls. The Triager posts `@crewpilot-repro-builder reproduce task <id>` to Switch; Switch routes the addressed message over SSE to the Builder's client. The Builder replies to Switch with evidence and hands off to `@crewpilot-reviewer review task <id>`.
-- **Decoupled Transport:** CrewPilot connects to Switch using standard Server-Sent Events (SSE) and HTTP operations. The team chat frontend (Discord, Slack, or Mattermost) is managed entirely by Switch.
+- **Decoupled Transport:** CrewPilot connects to Switch using standard Server-Sent Events (SSE) down and authenticated HTTP operations up. The team chat frontend (Discord, Slack, or Mattermost) is managed entirely by Switch.
 - **Auditable Multi-Identity Protocol:** Each agent maintains distinct Switch credentials (`.switch/*.json`) and least-privilege security permissions.
 
 ---
 
-## Empirical Verification: Target Bug `psf/requests#7634`
+## 4. Communication & Handoff Mechanism
 
-CrewPilot is verified against real open-source bugs, specifically **`psf/requests#7634`** (non-string form field name causes `AttributeError: 'int' object has no attribute 'translate'` when multipart files are attached).
+The squad workflow follows a strictly enforced state machine backed by SQLite transactions:
 
-### Complete Workflow Walkthrough
+```text
+awaiting_approval -> approved | changes_requested | cancelled
+changes_requested -> awaiting_approval | cancelled
+approved          -> reproducing | cancelled
+reproducing       -> under_review | changes_requested | cancelled
+under_review      -> review_approved | changes_requested | cancelled
+review_approved   -> publication_authorized | cancelled
+```
 
-1. **Maintainer posts in chat:**
+### Interaction Sequence
+1. **User asks for triage in chat:**
    ```text
    @crewpilot-triager triage https://github.com/psf/requests/issues/7634
    ```
-2. **Triager replies with structured assessment & Task ID:**
+2. **Triager replies with structured brief and UUID `task_id`:**
    ```text
    **Issue triage**
-   Task ID: `7b20c950-77f2-4140-b1f1-1e09033ad040`
+   Task ID: `5e9b4295-6ed3-4cec-a244-3edca4317a00`
    Category: Bug | Severity: Medium | Difficulty: Easy
-   Summary: When preparing a multipart request with files, non-string form field names in data cause an AttributeError...
-   To decide: reply 'approve 7b20c950-77f2-4140-b1f1-1e09033ad040'
+   Summary: When preparing a multipart request with files, non-string form field names cause an AttributeError...
+   To decide: reply 'approve 5e9b4295-6ed3-4cec-a244-3edca4317a00'
    ```
 3. **Maintainer approves scope:**
    ```text
-   @crewpilot-triager approve task 7b20c950-77f2-4140-b1f1-1e09033ad040
+   @crewpilot-triager approve task 5e9b4295-6ed3-4cec-a244-3edca4317a00
    ```
 4. **Triager emits Switch handoff:**
    ```text
-   @crewpilot-repro-builder reproduce task 7b20c950-77f2-4140-b1f1-1e09033ad040
+   @crewpilot-repro-builder reproduce task 5e9b4295-6ed3-4cec-a244-3edca4317a00
    ```
-5. **Reproducer executes isolated probe and reports empirical evidence:**
+5. **Reproducer executes probe and reports empirical evidence:**
    ```text
    ### 🔬 Bug Reproduction Confirmed
-   - Task ID: `7b20c950-77f2-4140-b1f1-1e09033ad040`
+   - Task ID: `5e9b4295-6ed3-4cec-a244-3edca4317a00`
    - Command: `python.exe repro_7634.py` (exit 1)
    - Summary: psf/requests#7634 reproduced: AttributeError raised on non-string key with multipart files.
    Evidence recorded in durable SQLite audit store. Handing off to Reviewer...
-   @crewpilot-reviewer review task 7b20c950-77f2-4140-b1f1-1e09033ad040
+   @crewpilot-reviewer review task 5e9b4295-6ed3-4cec-a244-3edca4317a00
    ```
-6. **Independent Reviewer audits evidence & prompts publication:**
+6. **Independent Reviewer audits evidence:**
    ```text
-   ### 🛡️ Independent Code & Evidence Review: Task `7b20c950-77f2-4140-b1f1-1e09033ad040`
+   ### 🛡️ Independent Code & Evidence Review: Task `5e9b4295-6ed3-4cec-a244-3edca4317a00`
    - Reviewer: @crewpilot-reviewer
-   - Verdict: ✅ EVIDENCE VERIFIED (Approved for Draft PR)
-   - Evidence Audit: Subprocess exit code 1 matches reported bug signature.
+   - Verdict: ✅ EVIDENCE VERIFIED (Approved for Publication)
+   - Evidence Audit: Subprocess exit code 1 matches exact signature ('int' object has no attribute 'translate').
    - Security Verification: PASS (Zero credentials leaked; execution strictly confined).
-   Human maintainer may authorize Draft PR: reply '@crewpilot-reviewer publish task 7b20c950-77f2-4140-b1f1-1e09033ad040'.
+   Human maintainer may authorize publication: reply '@crewpilot-reviewer publish task 5e9b4295-6ed3-4cec-a244-3edca4317a00'.
    ```
-7. **Maintainer authorizes publication:**
+7. **Maintainer authorizes publication manifest preparation:**
    ```text
-   @crewpilot-reviewer publish task 7b20c950-77f2-4140-b1f1-1e09033ad040
+   @crewpilot-reviewer publish task 5e9b4295-6ed3-4cec-a244-3edca4317a00
    ```
-   Reviewer records `pr_published` and outputs the verified Draft PR manifest with 7 immutable audit events.
+8. **Reviewer finalizes Publication Manifest:**
+   The task transitions to `publication_authorized` with full immutable audit history.
 
 ---
 
-## Quickstart & Demo
+## 5. Security & Safety Engineering
 
-### 1. Instant End-to-End Simulation Demo (Zero Setup Required)
-Run the authentic multi-agent workflow in 5 seconds without needing a local Switch server or LLM credits:
+- **Strict Requester Binding:** All human approvals (`approve` and `publish`) bind to the originating `requester_id` and exact `task_id`. Mismatched actors are rejected with explicit audit logging; room-level fallbacks are prohibited.
+- **Process Invocation:** Subprocesses run strictly with explicit argument arrays (`shell=False`). No shell string interpolation is permitted.
+- **Credential Reduction:** Subprocesses run in a stripped environment removing all API keys, tokens, and credentials (`SWITCH_API_KEY`, `OPENAI_API_KEY`, `GITHUB_TOKEN`, etc.).
+- **Automated Leak Scanning:** The Reviewer scans all captured outputs with `SECRET_LEAK_RE` before approving.
+- **Execution Isolation Boundary & Limitations:**
+  - **What is provided:** Credential-reduced subprocess execution in a disposable temporary workspace (`tempfile.mkdtemp(prefix="crewpilot-task-")`). Probe scripts and outputs are archived to `.evidence/task-<id>/`.
+  - **Limitations:** Subprocesses execute under the host OS user account without container-level namespace or cgroup isolation (e.g., Docker, Bubblewrap, or gVisor). Untrusted probe code could access host filesystem paths readable by the current user. True OS containerization is documented as a production roadmap item.
+- **Publication Ceiling (No False Draft PR Claim):** The squad finalizes an authorized publication manifest (`publication_authorized`) in durable SQLite. Automated remote PR creation against GitHub is disabled by default to avoid unapproved repository mutations.
+
+---
+
+## 6. Target Bug Verification: `psf/requests#7634`
+
+CrewPilot is verified against real open-source bugs, specifically **`psf/requests#7634`**:
+- **Bug:** When preparing a multipart request with files, non-string form field names in `data` cause `AttributeError: 'int' object has no attribute 'translate'` in `urllib3/fields.py`.
+- **Validation Criteria:** Strict verification requires exact issue identity (`psf/requests#7634`), exit code `1`, non-empty output, clean secret checks, and the exact error signature `'int' object has no attribute 'translate'`. Any deviation triggers revision request.
+- **Persistent Disk Artifacts:** Saved to `.evidence/task-<id>/`:
+  - `repro_probe.py`: Reproduction probe script.
+  - `output.log`: Execution stdout and stderr.
+  - `metadata.json`: Environmental metadata (Python, requests, urllib3, OS platform, execution duration).
+
+---
+
+## 7. Quickstart & How to Run
+
+### Prerequisites
+- Python 3.12 (reproduce inside a virtual environment `.venv`)
+- Git
+
+### 1. Setup Environment
+```bash
+git clone https://github.com/vincenzo-afk/CrewPilot.git
+cd CrewPilot
+python -m venv .venv
+# Windows:
+.venv\Scripts\activate
+# Linux/macOS:
+source .venv/bin/activate
+
+pip install -r requirements.txt
+```
+
+### 2. Run the Offline Simulation Demo
+Execute the full multi-agent workflow instantly without a live Switch server or external API keys:
 ```bash
 python demo/simulate_squad_demo.py
 ```
-This executes all 3 Switch agent connectors against `psf/requests#7634`, executes the real reproduction probe in an isolated sandbox, records all evidence in `crewpilot_demo.db`, and verifies the complete audit ledger.
+This runs the authentic connectors, executes the real reproduction probe in a temporary directory, confirms the exact `requests#7634` error, persists evidence to disk in `.evidence/`, and records 7 immutable audit log entries in `crewpilot_demo.db`.
 
-### 2. Run the Full Test Suite
+### 3. Run the Full Test Suite
 ```bash
 pytest -v
 ```
-**73 tests passing 100%**, covering:
-- Triager LLM parsing & issue fetching (`tests/test_triage_agent.py`, `tests/test_github_issues.py`)
+**84 unit and integration tests passing 100%**, covering:
+- Configuration and squad credential validation (`tests/test_config.py`)
+- GitHub issue parsing and error handling (`tests/test_github_issues.py`)
+- Reproducer sandbox containment and disk evidence persistence (`tests/test_reproducer.py`)
+- Multi-agent Switch room handoff integration and negative audits (`tests/test_squad_workflow.py`)
 - Switch SSE/HTTP protocol client (`tests/test_switch_agent_client.py`)
-- SQLite TaskStore atomic transactions & FSM transitions (`tests/test_task_store.py`)
-- Reproducer sandbox containment & environment sanitization (`tests/test_reproducer.py`)
-- Multi-agent Switch room handoff integration (`tests/test_squad_workflow.py`)
+- Switch triage room connector (`tests/test_switch_connector.py`)
+- SQLite TaskStore FSM state machine transitions (`tests/test_task_store.py`)
+- LLM triage agent parsing (`tests/test_triage_agent.py`)
 
-### 3. Running with Live Switch
-Register the 3 squad identities:
-```bash
-python -m switch.register_agent --role squad
-```
-Invite them to your Switch room (in Discord):
-```text
-!invite-agent @crewpilot-triager
-!invite-agent @crewpilot-repro-builder
-!invite-agent @crewpilot-reviewer
-```
-Start the squad runtime:
-```bash
-python main.py --role squad
-```
-
----
-
-## Security & Safety Engineering
-
-- **Subprocess Containment:** Subprocesses run strictly with explicit argument arrays (`shell=False`). No raw LLM-generated shell strings are ever executed.
-- **Environment Sanitization:** Subprocesses run in a stripped environment removing all API keys, tokens, and credentials (`SWITCH_API_KEY`, `OPENAI_API_KEY`, `GITHUB_TOKEN`, etc.).
-- **Automated Leak Scanning:** The Reviewer scans all captured outputs with `SECRET_LEAK_RE` before approving.
-- **Strict Authorization Binding:** Human approvals bind to the exact `task_id` and originating `requester_id`. Room-level fallback is strictly prohibited.
-- **Least-Privilege Identities:** The Reproducer and Reviewer do not have LLM API keys or GitHub write tokens.
-- **Draft PR Ceiling:** Automated operations can only generate Draft PRs; they cannot merge, deploy, or modify default branches.
+### 4. Running with Live Switch
+To deploy against a running Switch daemon:
+1. Register the three agent identities:
+   ```bash
+   python -m switch.register_agent --role squad
+   ```
+2. Start the multi-agent squad runtime:
+   ```bash
+   python main.py --role squad
+   ```
+3. Invite the squad into your Switch room (e.g., in Discord):
+   ```text
+   !invite-agent @crewpilot-triager
+   !invite-agent @crewpilot-repro-builder
+   !invite-agent @crewpilot-reviewer
+   ```
+*See [`docs/live-switch-verification.md`](docs/live-switch-verification.md) for live verification prerequisites and protocol checklists.*
 
 ---
 
-## Project Structure
+## 8. Offline Simulator vs. Live Switch Verification
+
+| Feature | Offline Simulator (`demo/simulate_squad_demo.py`) | Live Switch Runtime (`main.py --role squad`) |
+| :--- | :--- | :--- |
+| **Status** | **VERIFIED (84/84 tests passing)** | Documented protocol; server offline locally |
+| **Transport** | In-memory message delivery | Live HTTP SSE event stream & HTTP POST ops |
+| **Identities** | 3 simulated participant handles | 3 authenticated Switch identities (`.switch/*.json`) |
+| **Reproduction** | Real Python subprocess (`shell=False`) | Real Python subprocess (`shell=False`) |
+| **Evidence on Disk** | Persisted to `.evidence/task-<id>/` | Persisted to `.evidence/task-<id>/` |
+| **Persistence** | Durable SQLite TaskStore & Audit Ledger | Durable SQLite TaskStore & Audit Ledger |
+
+*See [`docs/live-switch-verification.md`](docs/live-switch-verification.md) for the 8-point live verification checklist and unverified integration risk analysis.*
+
+---
+
+## 9. Implemented vs. Planned Roadmap
+
+| Component | Status | Implementation Details |
+| :--- | :--- | :--- |
+| **Triager Agent** | Implemented | GitHub issue ingestion, LLM triage, fix planning, task creation |
+| **Human Scope Gate** | Implemented | Task ID and requester-bound approval verification |
+| **Reproducer Agent** | Implemented | Subprocess execution (`shell=False`), credential stripping, probe execution |
+| **Evidence Disk Store** | Implemented | Saved to `.evidence/task-<id>/` with metadata, logs, and probe script |
+| **Reviewer Agent** | Implemented | Read-only audit of exit code 1, exact error signature, and leak checks |
+| **Human Publication Gate** | Implemented | Authorized publication manifest preparation (`publication_authorized`) |
+| **Durable Audit Trail** | Implemented | SQLite database with append-only immutable audit log |
+| **OS Containerization** | Planned | Docker / Bubblewrap / gVisor kernel namespace isolation |
+| **Live Switch Verification** | Planned | Live daemon routing verification pending Switch server deployment |
+| **Automated Draft PR Push** | Planned | Scoped token push to GitHub remote branch after maintainer sign-off |
+
+---
+
+## 10. Project Structure
 
 ```text
 CrewPilot/
 ├── main.py                     # Multi-agent squad runtime entrypoint
-├── config.py                   # Environment configuration & credential loader
-├── github_issues.py            # GitHub issue resolution
+├── config.py                   # Configuration & fail-fast squad credential validator
+├── github_issues.py            # GitHub issue loader with rate-limit and error handling
 ├── agent/
 │   ├── prompts.py              # Structured triage system prompt & schema
 │   ├── triage_agent.py         # Multi-provider LLM triage agent
@@ -173,7 +269,7 @@ CrewPilot/
 ├── storage/
 │   └── task_store.py           # Durable SQLite persistence & immutable audit ledger
 ├── switch/
-│   ├── agent_client.py         # Real SSE + HTTP Switch agent protocol client
+│   ├── agent_client.py         # Official SSE + HTTP Switch agent protocol client
 │   ├── credentials.py          # Multi-agent local credential storage
 │   ├── register_agent.py       # Switch agent registration CLI (--role squad)
 │   ├── switch_connector.py     # Triager Switch room connector
@@ -185,6 +281,7 @@ CrewPilot/
 ├── docs/
 │   ├── architecture.md         # Squad architecture & trust boundary specification
 │   ├── demo-evidence.md        # Captured empirical evidence for psf/requests#7634
+│   ├── live-switch-verification.md # 8-point checklist & protocol claim analysis
 │   └── task-store-design.md    # Database schema & FSM transition rules
 └── tests/
     ├── test_config.py

@@ -1,10 +1,12 @@
 """End-to-end and component tests for the multi-agent squad workflow.
 
 Verifies:
-1. Triager connector + SQLite TaskStore.
+1. Triager connector + SQLite TaskStore with official Switch event payloads (string sender, message_id).
 2. Reproducer connector + isolated subprocess sandbox + evidence persistence.
-3. Reviewer connector + independent evidence audit + Draft PR authorization.
-4. Complete 3-agent Switch handoff chain (Triager -> Reproducer -> Reviewer).
+3. Reviewer connector + strict evidence verification (exact signature, exit code 1, clean leaks).
+4. Truthful publication manifest authorization (no fake GitHub PRs).
+5. Comprehensive negative tests (wrong error, wrong exit code, wrong repo, secret leaks).
+6. Complete 3-agent Switch handoff chain (Triager -> Reproducer -> Reviewer).
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from storage.task_store import (
     TaskStatus,
     TaskStore,
 )
+from github_issues import IssueInput
 from switch.repro_connector import SwitchReproConnector
 from switch.reviewer_connector import SwitchReviewerConnector
 from switch.switch_connector import SwitchTriageConnector
@@ -87,8 +90,11 @@ async def test_repro_ignores_unaddressed_event(
         "type": "message",
         "room_id": "room-1",
         "payload": {
+            "message_id": "msg-00",
             "body": "@crewpilot-repro-builder reproduce task 12345678",
             "addressed": False,
+            "sender": "user-1",
+            "sender_name": "Alice",
         },
     }
     await repro_connector.handle_event(event)
@@ -110,15 +116,17 @@ async def test_repro_rejects_unapproved_task(
         request_key="k1",
     )
 
+    # Realistic official payload with string sender and message_id
     event = {
         "type": "message",
         "room_id": "room-1",
         "payload": {
-            "id": "evt-1",
+            "message_id": "evt-1",
             "body": f"@crewpilot-repro-builder reproduce task {task.task_id}",
             "addressed": True,
             "thread_id": "th-1",
-            "sender": {"id": "user-1", "name": "Alice"},
+            "sender": "user-1",
+            "sender_name": "Alice",
         },
     }
     await repro_connector.handle_event(event)
@@ -141,7 +149,6 @@ async def test_repro_executes_for_approved_task(
         issue_source="psf/requests#7634",
         request_key="k1",
     )
-    # Human maintainer approves the task
     store.record_decision(
         task_id=task.task_id,
         room_id="room-1",
@@ -154,19 +161,16 @@ async def test_repro_executes_for_approved_task(
         "type": "message",
         "room_id": "room-1",
         "payload": {
-            "id": "evt-2",
+            "message_id": "evt-2",
             "body": f"@crewpilot-repro-builder reproduce task {task.task_id}",
             "addressed": True,
             "thread_id": "th-1",
-            "sender": {"id": "user-1", "name": "Alice"},
+            "sender": "user-1",
+            "sender_name": "Alice",
         },
     }
     await repro_connector.handle_event(event)
 
-    # Messages posted:
-    # 1. Sandbox progress notification
-    # 2. Reproduction report (success)
-    # 3. Handoff to @crewpilot-reviewer review task <task-id>
     assert len(fake_repro_client.posted_messages) == 3
     assert "Reproducing bug" in fake_repro_client.posted_messages[0][1]
     assert "Bug Reproduction Confirmed" in fake_repro_client.posted_messages[1][1]
@@ -183,7 +187,7 @@ async def test_repro_executes_for_approved_task(
     ev_list = store.list_evidence(task.task_id)
     assert len(ev_list) == 1
     assert "exit 1" in (ev_list[0].description or "")
-    assert "AttributeError" in (ev_list[0].output or "")
+    assert "'int' object has no attribute 'translate'" in (ev_list[0].output or "")
 
 
 @pytest.mark.asyncio
@@ -220,16 +224,17 @@ async def test_reviewer_verifies_evidence_and_approves(
     )
     store.update_task_status(task.task_id, TaskStatus.UNDER_REVIEW.value, actor_id="builder")
 
-    # Reviewer receives review handoff
+    # Reviewer receives review handoff with string sender
     event = {
         "type": "message",
         "room_id": "room-1",
         "payload": {
-            "id": "evt-rev-1",
+            "message_id": "evt-rev-1",
             "body": f"@crewpilot-reviewer review task {task.task_id}",
             "addressed": True,
             "thread_id": "th-1",
-            "sender": {"id": "crewpilot-repro-builder", "name": "Builder"},
+            "sender": "crewpilot-repro-builder",
+            "sender_name": "Builder",
         },
     }
     await reviewer_connector.handle_event(event)
@@ -243,6 +248,261 @@ async def test_reviewer_verifies_evidence_and_approves(
     updated = store.get_task(task.task_id)
     assert updated is not None
     assert updated.status == TaskStatus.REVIEW_APPROVED.value
+
+
+@pytest.mark.asyncio
+async def test_reviewer_rejects_wrong_attribute_error(
+    reviewer_connector: SwitchReviewerConnector,
+    fake_reviewer_client: FakeSwitchClient,
+    store: TaskStore,
+) -> None:
+    task = store.create_task(
+        room_id="room-1",
+        thread_id="th-1",
+        requester_id="user-1",
+        requester_name="Alice",
+        issue_source="psf/requests#7634",
+        request_key="k1",
+    )
+    store.record_decision(
+        task_id=task.task_id,
+        room_id="room-1",
+        thread_id="th-1",
+        actor_id="user-1",
+        decision=DecisionType.APPROVED.value,
+    )
+    store.update_task_status(task.task_id, TaskStatus.REPRODUCING.value, actor_id="builder")
+    # Output has wrong AttributeError ('str' instead of 'int' has no attribute 'translate')
+    store.add_evidence(
+        task_id=task.task_id,
+        evidence_type="reproduction_probe",
+        description="psf/requests#7634 (exit 1)",
+        command="python repro_probe.py",
+        output="AttributeError: 'str' object has no attribute 'unrelated_field'",
+        artifact_path="/tmp/repro.py",
+        actor_id="builder",
+    )
+    store.update_task_status(task.task_id, TaskStatus.UNDER_REVIEW.value, actor_id="builder")
+
+    await reviewer_connector.handle_event(
+        {
+            "type": "message",
+            "room_id": "room-1",
+            "payload": {
+                "message_id": "evt-rev-wrong-err",
+                "body": f"@crewpilot-reviewer review task {task.task_id}",
+                "addressed": True,
+                "thread_id": "th-1",
+                "sender": "crewpilot-repro-builder",
+                "sender_name": "Builder",
+            },
+        }
+    )
+
+    assert "REVISION REQUIRED" in fake_reviewer_client.posted_messages[-1][1]
+    assert "Missing expected error signature" in fake_reviewer_client.posted_messages[-1][1]
+    assert store.get_task(task.task_id).status == TaskStatus.CHANGES_REQUESTED.value
+
+
+@pytest.mark.asyncio
+async def test_reviewer_rejects_empty_output(
+    reviewer_connector: SwitchReviewerConnector,
+    fake_reviewer_client: FakeSwitchClient,
+    store: TaskStore,
+) -> None:
+    task = store.create_task(
+        room_id="room-1",
+        thread_id="th-1",
+        requester_id="user-1",
+        requester_name="Alice",
+        issue_source="psf/requests#7634",
+        request_key="k1",
+    )
+    store.record_decision(
+        task_id=task.task_id,
+        room_id="room-1",
+        thread_id="th-1",
+        actor_id="user-1",
+        decision=DecisionType.APPROVED.value,
+    )
+    store.update_task_status(task.task_id, TaskStatus.REPRODUCING.value, actor_id="builder")
+    store.add_evidence(
+        task_id=task.task_id,
+        evidence_type="reproduction_probe",
+        description="psf/requests#7634 (exit 1)",
+        command="python repro_probe.py",
+        output="",  # Empty output!
+        artifact_path="/tmp/repro.py",
+        actor_id="builder",
+    )
+    store.update_task_status(task.task_id, TaskStatus.UNDER_REVIEW.value, actor_id="builder")
+
+    await reviewer_connector.handle_event(
+        {
+            "type": "message",
+            "room_id": "room-1",
+            "payload": {
+                "message_id": "evt-rev-empty",
+                "body": f"@crewpilot-reviewer review task {task.task_id}",
+                "addressed": True,
+                "thread_id": "th-1",
+                "sender": "crewpilot-repro-builder",
+                "sender_name": "Builder",
+            },
+        }
+    )
+
+    assert "REVISION REQUIRED" in fake_reviewer_client.posted_messages[-1][1]
+    assert "Empty output" in fake_reviewer_client.posted_messages[-1][1]
+    assert store.get_task(task.task_id).status == TaskStatus.CHANGES_REQUESTED.value
+
+
+@pytest.mark.asyncio
+async def test_reviewer_rejects_unexpected_exit_code(
+    reviewer_connector: SwitchReviewerConnector,
+    fake_reviewer_client: FakeSwitchClient,
+    store: TaskStore,
+) -> None:
+    task = store.create_task(
+        room_id="room-1",
+        thread_id="th-1",
+        requester_id="user-1",
+        requester_name="Alice",
+        issue_source="psf/requests#7634",
+        request_key="k1",
+    )
+    store.record_decision(
+        task_id=task.task_id,
+        room_id="room-1",
+        thread_id="th-1",
+        actor_id="user-1",
+        decision=DecisionType.APPROVED.value,
+    )
+    store.update_task_status(task.task_id, TaskStatus.REPRODUCING.value, actor_id="builder")
+    store.add_evidence(
+        task_id=task.task_id,
+        evidence_type="reproduction_probe",
+        description="psf/requests#7634 passed (exit 0)",  # Exit 0 instead of 1
+        command="python repro_probe.py",
+        output="AttributeError: 'int' object has no attribute 'translate'",
+        artifact_path="/tmp/repro.py",
+        actor_id="builder",
+    )
+    store.update_task_status(task.task_id, TaskStatus.UNDER_REVIEW.value, actor_id="builder")
+
+    await reviewer_connector.handle_event(
+        {
+            "type": "message",
+            "room_id": "room-1",
+            "payload": {
+                "message_id": "evt-rev-exit0",
+                "body": f"@crewpilot-reviewer review task {task.task_id}",
+                "addressed": True,
+                "thread_id": "th-1",
+                "sender": "crewpilot-repro-builder",
+                "sender_name": "Builder",
+            },
+        }
+    )
+
+    assert "REVISION REQUIRED" in fake_reviewer_client.posted_messages[-1][1]
+    assert "Exit code was not 1" in fake_reviewer_client.posted_messages[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_reviewer_rejects_unsupported_issue_target(
+    reviewer_connector: SwitchReviewerConnector,
+    fake_reviewer_client: FakeSwitchClient,
+    store: TaskStore,
+) -> None:
+    # Issue target is flask instead of requests
+    task = store.create_task(
+        room_id="room-1",
+        thread_id="th-1",
+        requester_id="user-1",
+        requester_name="Alice",
+        issue_source="pallets/flask#7634",
+        request_key="k1",
+    )
+    store.record_decision(
+        task_id=task.task_id,
+        room_id="room-1",
+        thread_id="th-1",
+        actor_id="user-1",
+        decision=DecisionType.APPROVED.value,
+    )
+    store.update_task_status(task.task_id, TaskStatus.REPRODUCING.value, actor_id="builder")
+    store.update_task_status(task.task_id, TaskStatus.UNDER_REVIEW.value, actor_id="builder")
+
+    await reviewer_connector.handle_event(
+        {
+            "type": "message",
+            "room_id": "room-1",
+            "payload": {
+                "message_id": "evt-rev-unsupported",
+                "body": f"@crewpilot-reviewer review task {task.task_id}",
+                "addressed": True,
+                "thread_id": "th-1",
+                "sender": "crewpilot-repro-builder",
+                "sender_name": "Builder",
+            },
+        }
+    )
+
+    assert "Unsupported Target" in fake_reviewer_client.posted_messages[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_reviewer_rejects_secret_leak_in_output(
+    reviewer_connector: SwitchReviewerConnector,
+    fake_reviewer_client: FakeSwitchClient,
+    store: TaskStore,
+) -> None:
+    task = store.create_task(
+        room_id="room-1",
+        thread_id="th-1",
+        requester_id="user-1",
+        requester_name="Alice",
+        issue_source="psf/requests#7634",
+        request_key="k1",
+    )
+    store.record_decision(
+        task_id=task.task_id,
+        room_id="room-1",
+        thread_id="th-1",
+        actor_id="user-1",
+        decision=DecisionType.APPROVED.value,
+    )
+    store.update_task_status(task.task_id, TaskStatus.REPRODUCING.value, actor_id="builder")
+    # Output has leaked token!
+    store.add_evidence(
+        task_id=task.task_id,
+        evidence_type="reproduction_probe",
+        description="psf/requests#7634 (exit 1)",
+        command="python repro_probe.py",
+        output="AttributeError: 'int' object has no attribute 'translate'\nToken: sk-proj12345678901234567890",
+        artifact_path="/tmp/repro.py",
+        actor_id="builder",
+    )
+    store.update_task_status(task.task_id, TaskStatus.UNDER_REVIEW.value, actor_id="builder")
+
+    await reviewer_connector.handle_event(
+        {
+            "type": "message",
+            "room_id": "room-1",
+            "payload": {
+                "message_id": "evt-rev-leak",
+                "body": f"@crewpilot-reviewer review task {task.task_id}",
+                "addressed": True,
+                "thread_id": "th-1",
+                "sender": "crewpilot-repro-builder",
+                "sender_name": "Builder",
+            },
+        }
+    )
+
+    assert "REVISION REQUIRED" in fake_reviewer_client.posted_messages[-1][1]
+    assert "secret or credential pattern detected" in fake_reviewer_client.posted_messages[-1][1]
 
 
 @pytest.mark.asyncio
@@ -270,49 +530,62 @@ async def test_reviewer_publish_flow_authorization_enforced(
     store.update_task_status(task.task_id, TaskStatus.UNDER_REVIEW.value, actor_id="builder")
     store.update_task_status(task.task_id, TaskStatus.REVIEW_APPROVED.value, actor_id="reviewer")
 
-    # 1. Unauthorized user tries to publish
+    # 1. Unauthorized user tries to publish (string sender: "mallory-attacker")
     unauth_event = {
         "type": "message",
         "room_id": "room-1",
         "payload": {
-            "id": "evt-pub-1",
+            "message_id": "evt-pub-1",
             "body": f"@crewpilot-reviewer publish task {task.task_id}",
             "addressed": True,
             "thread_id": "th-1",
-            "sender": {"id": "mallory-attacker", "name": "Mallory"},
+            "sender": "mallory-attacker",
+            "sender_name": "Mallory",
         },
     }
     await reviewer_connector.handle_event(unauth_event)
     assert (
-        "Only Alice can authorize Draft PR publication"
+        "Only Alice can authorize publication manifest preparation"
         in fake_reviewer_client.posted_messages[-1][1]
     )
 
     # Task status must NOT be changed
     assert store.get_task(task.task_id).status == TaskStatus.REVIEW_APPROVED.value
 
-    # 2. Authorized requester publishes
+    # 2. Authorized requester publishes with official string sender ("user-1")
     auth_event = {
         "type": "message",
         "room_id": "room-1",
         "payload": {
-            "id": "evt-pub-2",
+            "message_id": "evt-pub-2",
             "body": f"@crewpilot-reviewer publish task {task.task_id}",
             "addressed": True,
             "thread_id": "th-1",
-            "sender": {"id": "user-1", "name": "Alice"},
+            "sender": "user-1",
+            "sender_name": "Alice",
         },
     }
     await reviewer_connector.handle_event(auth_event)
-    assert "Draft PR Manifest Prepared" in fake_reviewer_client.posted_messages[-1][1]
-    assert store.get_task(task.task_id).status == TaskStatus.PR_PUBLISHED.value
+    assert "Publication Manifest Prepared" in fake_reviewer_client.posted_messages[-1][1]
+    assert "No remote PR published" in fake_reviewer_client.posted_messages[-1][1]
+    assert store.get_task(task.task_id).status == TaskStatus.PUBLICATION_AUTHORIZED.value
 
 
 @pytest.mark.asyncio
-async def test_full_squad_handoff_integration(tmp_path: Path) -> None:
+async def test_full_squad_handoff_integration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Full end-to-end integration test simulating the real 3-agent Squad in Switch."""
     db_file = tmp_path / "full_squad.db"
     store = TaskStore(db_file)
+
+    async def mock_load_issue(raw: str, token: str | None = None) -> IssueInput:
+        return IssueInput(
+            text="Multipart non-string field keys cause AttributeError during encode",
+            source="psf/requests#7634",
+        )
+
+    monkeypatch.setattr("switch.switch_connector.load_issue", mock_load_issue)
 
     triager_client = FakeSwitchClient("crewpilot-triager")
     repro_client = FakeSwitchClient("crewpilot-repro-builder")
@@ -324,17 +597,13 @@ async def test_full_squad_handoff_integration(tmp_path: Path) -> None:
     mock_result.severity = "medium"
     mock_result.difficulty = "easy"
     mock_result.summary = "Fix multipart non-string form key encoding"
-    mock_result.root_cause = "Non-string key causes AttributeError during encode"
-    mock_result.steps_to_fix = ["Convert key to str before translation"]
-    mock_result.confidence = 0.95
+    mock_result.suggested_fix_plan = ["Convert key to str before translation"]
     mock_result.to_dict.return_value = {
         "category": "bug",
         "severity": "medium",
         "difficulty": "easy",
         "summary": "Fix multipart non-string form key encoding",
-        "root_cause": "Non-string key causes AttributeError during encode",
-        "steps_to_fix": ["Convert key to str before translation"],
-        "confidence": 0.95,
+        "suggested_fix_plan": ["Convert key to str before translation"],
     }
     mock_agent.triage.return_value = mock_result
 
@@ -360,17 +629,18 @@ async def test_full_squad_handoff_integration(tmp_path: Path) -> None:
     room = "test-room"
     thread = "test-thread"
 
-    # Step 1: User requests triage in Switch room
+    # Step 1: User requests triage in Switch room with documented string sender
     await triager.handle_event(
         {
             "type": "message",
             "room_id": room,
             "payload": {
-                "id": "step1-msg",
+                "message_id": "step1-msg",
                 "body": "@crewpilot-triager triage https://github.com/psf/requests/issues/7634",
                 "addressed": True,
                 "thread_id": thread,
-                "sender": {"id": "maintainer-kamal", "name": "Kamal"},
+                "sender": "maintainer-kamal",
+                "sender_name": "Kamal",
             },
         }
     )
@@ -386,11 +656,12 @@ async def test_full_squad_handoff_integration(tmp_path: Path) -> None:
             "type": "message",
             "room_id": room,
             "payload": {
-                "id": "step2-msg",
+                "message_id": "step2-msg",
                 "body": f"@crewpilot-triager approve task {task_id}",
                 "addressed": True,
                 "thread_id": thread,
-                "sender": {"id": "maintainer-kamal", "name": "Kamal"},
+                "sender": "maintainer-kamal",
+                "sender_name": "Kamal",
             },
         }
     )
@@ -409,11 +680,12 @@ async def test_full_squad_handoff_integration(tmp_path: Path) -> None:
             "type": "message",
             "room_id": room,
             "payload": {
-                "id": "step3-msg",
+                "message_id": "step3-msg",
                 "body": triager_handoff,
                 "addressed": True,
                 "thread_id": thread,
-                "sender": {"id": "crewpilot-triager", "name": "Triager"},
+                "sender": "crewpilot-triager",
+                "sender_name": "Triager",
             },
         }
     )
@@ -432,11 +704,12 @@ async def test_full_squad_handoff_integration(tmp_path: Path) -> None:
             "type": "message",
             "room_id": room,
             "payload": {
-                "id": "step4-msg",
+                "message_id": "step4-msg",
                 "body": repro_handoff,
                 "addressed": True,
                 "thread_id": thread,
-                "sender": {"id": "crewpilot-repro-builder", "name": "Builder"},
+                "sender": "crewpilot-repro-builder",
+                "sender_name": "Builder",
             },
         }
     )
@@ -446,26 +719,28 @@ async def test_full_squad_handoff_integration(tmp_path: Path) -> None:
     review_post = reviewer_client.posted_messages[-1][1]
     assert "EVIDENCE VERIFIED" in review_post
 
-    # Step 5: Maintainer authorizes Draft PR publication
+    # Step 5: Maintainer authorizes publication manifest preparation
     await reviewer.handle_event(
         {
             "type": "message",
             "room_id": room,
             "payload": {
-                "id": "step5-msg",
+                "message_id": "step5-msg",
                 "body": f"@crewpilot-reviewer publish task {task_id}",
                 "addressed": True,
                 "thread_id": thread,
-                "sender": {"id": "maintainer-kamal", "name": "Kamal"},
+                "sender": "maintainer-kamal",
+                "sender_name": "Kamal",
             },
         }
     )
 
-    # Task transitions to PR_PUBLISHED with complete audit trail
-    assert store.get_task(task_id).status == TaskStatus.PR_PUBLISHED.value
+    # Task transitions to PUBLICATION_AUTHORIZED with complete audit trail
+    assert store.get_task(task_id).status == TaskStatus.PUBLICATION_AUTHORIZED.value
     publish_post = reviewer_client.posted_messages[-1][1]
-    assert "Draft PR Manifest Prepared" in publish_post
+    assert "Publication Manifest Prepared" in publish_post
+    assert "No remote PR published" in publish_post
     assert (
-        "All evidence, approval logs, and audit trails are persisted in durable SQLite"
+        "The publication manifest and complete audit trail are recorded in durable SQLite"
         in publish_post
     )

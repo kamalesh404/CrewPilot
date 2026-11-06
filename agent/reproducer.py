@@ -1,16 +1,24 @@
-"""Execution sandbox for reproducing reported issues under strict isolation.
+"""Credential-reduced subprocess execution in a disposable temporary workspace.
 
 Enforces:
   1. Subprocess execution with explicit argument arrays (shell=False).
   2. Stripped environment variables (no host secrets, API keys, or tokens leaked).
-  3. Strict command allowlist and execution timeouts.
-  4. Working directory containment in temporary disposable directories.
+  3. Strict command allowlists and execution timeouts.
+  4. Execution within a temporary workspace with persistent evidence preservation.
   5. Capped stdout/stderr capture to prevent memory and messaging overflows.
+
+LIMITATION NOTICE:
+  This module does not provide OS-level filesystem or network isolation (no cgroups,
+  namespaces, chroot, or Docker containerization). Arbitrary untrusted code from issue
+  descriptions is NOT executed. Only predefined, fixed reproduction probes are run.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import platform
+import re
 import subprocess
 import sys
 import tempfile
@@ -20,6 +28,12 @@ from pathlib import Path
 
 MAX_OUTPUT_CHARS = 4000
 DEFAULT_TIMEOUT_SECONDS = 30.0
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_EVIDENCE_ROOT = PROJECT_ROOT / ".evidence"
+
+SUPPORTED_ISSUE = ("psf", "requests", "7634")
+EXPECTED_FAILURE_SIGNATURE = "'int' object has no attribute 'translate'"
 
 # Sanitized environment variable blocklist (strip all sensitive variables)
 SECRET_ENV_PATTERNS = (
@@ -51,6 +65,18 @@ class ReproductionResult:
     artifact_path: str | None = None
 
 
+def parse_issue_identity(issue_source: str) -> tuple[str, str, str] | None:
+    """Parse (owner, repo, issue_number) from an issue source or URL."""
+    text = issue_source.strip()
+    match = re.search(
+        r"(?:https?://github\.com/)?([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(?:/issues/|#)(\d+)",
+        text,
+    )
+    if not match:
+        return None
+    return match.group(1).lower(), match.group(2).lower(), match.group(3)
+
+
 def get_sanitized_env() -> dict[str, str]:
     """Return a sanitized copy of the environment with all secrets removed."""
     clean_env: dict[str, str] = {}
@@ -66,6 +92,14 @@ def get_sanitized_env() -> dict[str, str]:
     return clean_env
 
 
+def _get_pkg_version(module_name: str) -> str:
+    try:
+        mod = __import__(module_name)
+        return str(getattr(mod, "__version__", "unknown"))
+    except Exception:
+        return "not_installed"
+
+
 def run_reproduction(
     *,
     task_id: str,
@@ -74,56 +108,74 @@ def run_reproduction(
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     base_dir: Path | None = None,
 ) -> ReproductionResult:
-    """Execute reproduction in an isolated temporary directory.
+    """Execute reproduction probe in a temporary workspace with persistent evidence.
 
-    For psf/requests#7634, runs the probe reproducing the non-string field name
-    AttributeError in multipart form encoding.
+    Fails closed for unsupported issue targets. For psf/requests#7634, runs the
+    exact probe reproducing the non-string multipart field name crash.
     """
     start_time = time.monotonic()
     clean_env = get_sanitized_env()
 
+    parsed_issue = parse_issue_identity(issue_source)
+
+    if parsed_issue == SUPPORTED_ISSUE:
+        script_content = (
+            "import sys\n"
+            "import requests\n\n"
+            "try:\n"
+            "    print('Testing requests multipart preparation with non-string form key...')\n"
+            "    req = requests.Request('POST', 'http://x', data={1: 'a'}, files={'f': b'x'}).prepare()\n"
+            "    print('UNEXPECTED: Request prepared without error.')\n"
+            "    sys.exit(0)\n"
+            "except AttributeError as exc:\n"
+            "    print(f'REPRODUCED_BUG: AttributeError encountered: {exc}')\n"
+            "    import traceback\n"
+            "    traceback.print_exc()\n"
+            "    sys.exit(1)\n"
+            "except Exception as exc:\n"
+            "    print(f'UNEXPECTED_ERROR: {type(exc).__name__}: {exc}')\n"
+            "    sys.exit(2)\n"
+        )
+        command_desc = f"{Path(sys.executable).name} repro_7634.py"
+    elif custom_script:
+        script_content = custom_script
+        command_desc = f"{Path(sys.executable).name} repro_custom.py"
+    else:
+        # Fail closed: No verified reproduction probe exists for this issue target
+        duration = time.monotonic() - start_time
+        msg = (
+            f"No verified reproduction probe exists for target '{issue_source}'. "
+            "Supported targets: psf/requests#7634."
+        )
+        return ReproductionResult(
+            success=False,
+            summary=msg,
+            command="none",
+            exit_code=-3,
+            stdout="",
+            stderr=msg,
+            output=msg,
+            duration_s=round(duration, 3),
+            workspace_path="",
+            artifact_path=None,
+        )
+
+    # Prepare stable, persistent evidence directory keyed by task_id
+    evidence_root = base_dir or DEFAULT_EVIDENCE_ROOT
+    task_evidence_dir = evidence_root / f"task-{task_id}"
+    task_evidence_dir.mkdir(parents=True, exist_ok=True)
+    probe_artifact = task_evidence_dir / "repro_probe.py"
+    probe_artifact.write_text(script_content, encoding="utf-8")
+
+    # Run execution inside a temporary working directory
     with tempfile.TemporaryDirectory(
         prefix=f"crewpilot-task-{task_id[:8]}-", dir=base_dir
     ) as tmpdir:
         tmp_path = Path(tmpdir)
+        exec_script = tmp_path / "repro_probe.py"
+        exec_script.write_text(script_content, encoding="utf-8")
 
-        # Build reproduction script
-        if "7634" in issue_source or "requests" in issue_source.lower():
-            # Dedicated probe for psf/requests#7634
-            script_content = (
-                "import sys\n"
-                "import requests\n\n"
-                "try:\n"
-                "    print('Testing requests multipart preparation with non-string form key...')\n"
-                "    req = requests.Request('POST', 'http://x', data={1: 'a'}, files={'f': b'x'}).prepare()\n"
-                "    print('UNEXPECTED: Request prepared without error.')\n"
-                "    sys.exit(0)\n"
-                "except AttributeError as exc:\n"
-                "    print(f'REPRODUCED_BUG: AttributeError encountered: {exc}')\n"
-                "    import traceback\n"
-                "    traceback.print_exc()\n"
-                "    sys.exit(1)\n"
-                "except Exception as exc:\n"
-                "    print(f'UNEXPECTED_ERROR: {type(exc).__name__}: {exc}')\n"
-                "    sys.exit(2)\n"
-            )
-            command_desc = f"{Path(sys.executable).name} repro_7634.py"
-        elif custom_script:
-            script_content = custom_script
-            command_desc = f"{Path(sys.executable).name} repro_custom.py"
-        else:
-            script_content = (
-                "import sys\n"
-                "print('No specific reproduction probe defined for this issue.')\n"
-                "sys.exit(0)\n"
-            )
-            command_desc = f"{Path(sys.executable).name} repro_default.py"
-
-        script_file = tmp_path / "repro_probe.py"
-        script_file.write_text(script_content, encoding="utf-8")
-
-        # Execute using explicit argument arrays; shell=False
-        cmd = [sys.executable, str(script_file)]
+        cmd = [sys.executable, str(exec_script)]
 
         try:
             proc = subprocess.run(
@@ -148,42 +200,62 @@ def run_reproduction(
             stderr = f"Subprocess launch failed: {exc}"
             exit_code = -2
 
-        duration = time.monotonic() - start_time
+    duration = time.monotonic() - start_time
 
-        combined_output = ""
-        if stdout:
-            combined_output += stdout
-        if stderr:
-            if combined_output:
-                combined_output += "\n--- STDERR ---\n"
-            combined_output += stderr
+    combined_output = ""
+    if stdout:
+        combined_output += stdout
+    if stderr:
+        if combined_output:
+            combined_output += "\n--- STDERR ---\n"
+        combined_output += stderr
 
-        clipped_output = combined_output[:MAX_OUTPUT_CHARS]
-        if len(combined_output) > MAX_OUTPUT_CHARS:
-            clipped_output += "\n...(output truncated)..."
+    clipped_output = combined_output[:MAX_OUTPUT_CHARS]
+    if len(combined_output) > MAX_OUTPUT_CHARS:
+        clipped_output += "\n...(output truncated)..."
 
-        # Determine success
-        if "7634" in issue_source or "requests" in issue_source.lower():
-            # For 7634, exit_code 1 with AttributeError is the exact proof of reproduction
-            is_reproduced = (exit_code == 1) and ("AttributeError" in clipped_output)
-            summary = (
-                f"psf/requests#7634 reproduced: AttributeError raised on non-string key with multipart files (exit {exit_code})."
-                if is_reproduced
-                else f"psf/requests#7634 reproduction failed (exit {exit_code})."
-            )
-        else:
-            is_reproduced = exit_code != 0
-            summary = f"Reproduction probe completed with exit code {exit_code} in {duration:.2f}s."
+    # Persist log and execution metadata to persistent evidence directory
+    output_log = task_evidence_dir / "output.log"
+    output_log.write_text(combined_output, encoding="utf-8")
 
-        return ReproductionResult(
-            success=is_reproduced,
-            summary=summary,
-            command=command_desc,
-            exit_code=exit_code,
-            stdout=stdout[:MAX_OUTPUT_CHARS],
-            stderr=stderr[:MAX_OUTPUT_CHARS],
-            output=clipped_output,
-            duration_s=round(duration, 3),
-            workspace_path=str(tmp_path),
-            artifact_path=str(script_file),
+    meta = {
+        "task_id": task_id,
+        "target_issue": issue_source,
+        "command": command_desc,
+        "exit_code": exit_code,
+        "stdout": stdout[:MAX_OUTPUT_CHARS],
+        "stderr": stderr[:MAX_OUTPUT_CHARS],
+        "combined_output": clipped_output,
+        "python_version": sys.version,
+        "requests_version": _get_pkg_version("requests"),
+        "urllib3_version": _get_pkg_version("urllib3"),
+        "platform": platform.platform(),
+        "duration_s": round(duration, 3),
+    }
+    meta_path = task_evidence_dir / "metadata.json"
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    # Determine success with strict signature check
+    if parsed_issue == SUPPORTED_ISSUE:
+        is_reproduced = (exit_code == 1) and (EXPECTED_FAILURE_SIGNATURE in clipped_output)
+        summary = (
+            f"psf/requests#7634 reproduced: AttributeError raised on non-string key with multipart files (exit {exit_code})."
+            if is_reproduced
+            else f"psf/requests#7634 reproduction failed (exit {exit_code})."
         )
+    else:
+        is_reproduced = exit_code != 0
+        summary = f"Reproduction probe completed with exit code {exit_code} in {duration:.2f}s."
+
+    return ReproductionResult(
+        success=is_reproduced,
+        summary=summary,
+        command=command_desc,
+        exit_code=exit_code,
+        stdout=stdout[:MAX_OUTPUT_CHARS],
+        stderr=stderr[:MAX_OUTPUT_CHARS],
+        output=clipped_output,
+        duration_s=round(duration, 3),
+        workspace_path=str(task_evidence_dir),
+        artifact_path=str(probe_artifact),
+    )

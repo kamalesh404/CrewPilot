@@ -38,9 +38,10 @@ class Settings:
         cls,
         agent_name: str | None = None,
         require_llm: bool = True,
+        fallback_to_default: bool = True,
     ) -> "Settings":
         if agent_name:
-            saved = load_saved_credentials(agent_name)
+            saved = load_saved_credentials(agent_name, fallback_to_default=fallback_to_default)
         else:
             saved = load_saved_credentials()
 
@@ -62,11 +63,11 @@ class Settings:
                 os.getenv("SWITCH_API_URL") or saved.get("api_url") or ""
             ).strip().rstrip("/"),
             switch_agent_id=(
-                os.getenv("SWITCH_AGENT_ID") or saved.get("agent_id") or ""
-            ).strip(),
+                os.getenv("SWITCH_AGENT_ID") if not agent_name else None
+            ) or saved.get("agent_id") or "",
             switch_api_key=(
-                os.getenv("SWITCH_API_KEY") or saved.get("api_key") or ""
-            ).strip(),
+                os.getenv("SWITCH_API_KEY") if not agent_name else None
+            ) or saved.get("api_key") or "",
             switch_agent_name=resolved_name,
             llm_provider=provider,
             openai_api_key=os.getenv("OPENAI_API_KEY") or None,
@@ -93,10 +94,9 @@ class Settings:
             )
         if not self.switch_agent_id or not self.switch_api_key:
             raise ConfigError(
-                "Switch agent credentials are missing. Run "
-                "`python -m switch.register_agent --name crewpilot` with "
-                "SWITCH_REGISTRATION_TOKEN set, or provide SWITCH_AGENT_ID and "
-                "SWITCH_API_KEY in .env."
+                f"Switch agent credentials are missing for agent '{self.switch_agent_name}'. "
+                "Run `python -m switch.register_agent --role squad` with "
+                "SWITCH_REGISTRATION_TOKEN set, or provide role credentials in .switch/."
             )
         if require_llm:
             if self.llm_provider == "openai" and not self.openai_api_key:

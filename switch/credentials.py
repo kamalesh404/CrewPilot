@@ -13,13 +13,22 @@ CREDENTIALS_PATH = PROJECT_ROOT / ".switch" / "agent.json"
 _KEYS = ("api_url", "agent_id", "api_key", "agent_name")
 
 
-def load_saved_credentials(agent_name: str | None = None) -> dict[str, str]:
-    """Return credentials saved for a specific agent, or default agent.json."""
+def load_saved_credentials(
+    agent_name: str | None = None,
+    fallback_to_default: bool = True,
+) -> dict[str, str]:
+    """Return credentials saved for a specific agent, or default agent.json.
+
+    When fallback_to_default is False and an agent_name is provided, only the
+    exact role-specific credentials file (.switch/<sanitized_name>.json) is checked,
+    preventing silent identity aliasing across distinct squad roles.
+    """
     paths_to_check: list[Path] = []
     if agent_name:
         sanitized = re.sub(r"[^a-zA-Z0-9_.-]", "_", agent_name.strip().lower())
         paths_to_check.append(PROJECT_ROOT / ".switch" / f"{sanitized}.json")
-    paths_to_check.append(CREDENTIALS_PATH)
+    if fallback_to_default or not agent_name:
+        paths_to_check.append(CREDENTIALS_PATH)
 
     for path in paths_to_check:
         try:

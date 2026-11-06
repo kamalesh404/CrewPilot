@@ -99,11 +99,26 @@ class SwitchTriageConnector:
         if not room_id or not body:
             return
 
-        sender_name = str(payload.get("sender_name") or "there").strip() or "there"
-        if sender_name.casefold() == self.agent_name.casefold():
+        # Sender identity extraction:
+        # Documented protocol: payload.sender is a participant ID string
+        # payload.sender_name is the user display name
+        raw_name = payload.get("sender_name")
+        raw_sender = payload.get("sender")
+        if isinstance(raw_sender, str) and raw_sender.strip():
+            sender_id = raw_sender.strip()
+            sender_name = str(raw_name or sender_id).strip()
+        elif isinstance(raw_sender, dict):
+            sender_id = str(raw_sender.get("id") or raw_sender.get("name") or "user").strip()
+            sender_name = str(raw_sender.get("name") or raw_name or sender_id).strip()
+        else:
+            sender_id = str(payload.get("sender_id") or raw_name or "user").strip()
+            sender_name = str(raw_name or sender_id).strip()
+
+        if sender_name.casefold() == self.agent_name.casefold() or sender_id.casefold() == self.agent_name.casefold():
             return  # Never react to our own posts.
 
-        message_id = str(payload.get("message_id") or "")
+        # Deduplication using message_id (official protocol) with fallback to id
+        message_id = str(payload.get("message_id") or payload.get("id") or "")
         if message_id:
             if message_id in self._seen_messages:
                 logger.debug("Ignoring duplicate Switch message %s", message_id)
@@ -114,14 +129,6 @@ class SwitchTriageConnector:
 
         raw_thread = payload.get("thread_id")
         thread_id = str(raw_thread) if raw_thread else None
-        sender = payload.get("sender")
-        if isinstance(sender, dict):
-            sender_id = str(sender.get("id") or sender.get("name") or sender_name)
-            sender_name = str(sender.get("name") or sender.get("username") or sender_name)
-        elif isinstance(sender, str) and sender.strip():
-            sender_id = sender.strip()
-        else:
-            sender_id = str(payload.get("sender_id") or sender_name)
         normalized = self._normalize(body)
 
         if HELP_RE.fullmatch(normalized):

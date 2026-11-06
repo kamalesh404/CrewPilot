@@ -97,13 +97,22 @@ The durable database records the full transaction history across all 3 Switch ag
 | `2026-11-06T14:34:46.551` | `crewpilot-repro-builder` | `EVIDENCE_ADDED` | Reproduction probe artifact attached (exit 1) |
 | `2026-11-06T14:34:46.560` | `crewpilot-repro-builder` | `STATUS_CHANGED` | Status transitioned from `reproducing` -> `under_review` |
 | `2026-11-06T14:34:47.209` | `crewpilot-reviewer` | `STATUS_CHANGED` | Status transitioned from `under_review` -> `review_approved` |
-| `2026-11-06T14:34:47.556` | `maintainer-vincenzo` | `STATUS_CHANGED` | Status transitioned from `review_approved` -> `pr_published` |
+| `2026-11-06T14:34:47.556` | `maintainer-vincenzo` | `STATUS_CHANGED` | Status transitioned from `review_approved` -> `publication_authorized` |
 
 ---
 
-## 4. Security Audit Verification
+## 4. Persistent Disk Evidence (`.evidence/`)
+
+In addition to SQLite storage, reproduction artifacts are persisted on disk at `.evidence/task-<id>/`:
+- `repro_probe.py`: The isolated reproduction probe script.
+- `output.log`: Complete stdout and stderr captured during execution.
+- `metadata.json`: Environmental metadata recording Python version, dependency versions (`requests`, `urllib3`), platform, duration, and exit code.
+
+---
+
+## 5. Security Audit Verification
 
 - **Process Execution:** Zero shell string interpolation; 100% array invocation (`shell=False`).
 - **Environment Isolation:** Zero host tokens (`SWITCH_API_KEY`, `OPENAI_API_KEY`, `GITHUB_TOKEN`) exposed to the reproduction subprocess.
 - **Reviewer Independence:** Read-only verification; Reviewer cannot modify evidence or review changes without audit logging.
-- **Draft PR Publication Protection:** Only the authenticated human requester (`maintainer-vincenzo`) can authorize publication to `pr_published`.
+- **Publication Protection:** Only the authenticated human requester (`maintainer-vincenzo`) can authorize manifest preparation to `publication_authorized`. No automated remote PRs are pushed to GitHub in this mode.
