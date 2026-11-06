@@ -4,9 +4,8 @@ Chat text arrives from Switch over SSE; results are posted back with Switch
 operations. Switch's Discord bridge mirrors both directions to the channel, so
 this module never talks to Discord directly.
 
-The human approval step is a message: mention the agent and reply `approve`,
-or mention it with `changes <feedback>`. Approvals live in memory and are
-recorded in the room; this MVP does not write labels back to GitHub.
+Human approvals use exact task IDs and are recorded in the durable SQLite store:
+  mention the agent and reply `approve <task-id>` or `changes <task-id> <feedback>`.
 """
 
 from __future__ import annotations
@@ -21,6 +20,16 @@ from typing import Any
 
 from agent.triage_agent import TriageAgent, TriageError, TriageResult
 from github_issues import GITHUB_ISSUE_RE, IssueFetchError, load_issue
+from storage.task_store import (
+    DecisionType,
+    TaskNotFoundError,
+    TaskRoomMismatchError,
+    TaskStateError,
+    TaskStatus,
+    TaskStore,
+    TaskThreadMismatchError,
+    UnauthorizedActorError,
+)
 from switch.agent_client import SwitchAgentClient, SwitchAuthError, SwitchError
 
 logger = logging.getLogger(__name__)
@@ -32,12 +41,13 @@ MAX_STEP_CHARS = 240
 MAX_ERROR_CHARS = 400
 
 APPROVE_RE = re.compile(
-    r"^(?:please\s+)?(?:approve|approved|lgtm|looks good|ship it)(?:\s+plan)?[.!]*$",
+    r"^(?:please\s+)?(?:approve|approved|lgtm|looks\s+good|ship\s+it)(?:\s+plan)?(?:\s+task)?(?:\s+([0-9a-fA-F-]{8,36}))?[.!]*$",
     re.IGNORECASE,
 )
 CHANGES_RE = re.compile(
     r"^(?:please\s+)?"
-    r"(?:changes?|request(?:ed)? changes|needs changes|reject(?:ed)?|decline|deny)"
+    r"(?:changes?|request(?:ed)?\s+changes|needs\s+changes|reject(?:ed)?|decline|deny)"
+    r"(?:\s+task)?(?:\s+([0-9a-fA-F-]{8,36}))?"
     r"\b[:,;\s-]*(.*)$",
     re.IGNORECASE | re.DOTALL,
 )
@@ -54,20 +64,24 @@ class PendingTriage:
 
 
 class SwitchTriageConnector:
-    """Routes addressed Switch messages through the triage agent and back."""
+    """Routes addressed Switch messages through the triage agent and durable store."""
 
     def __init__(
         self,
         *,
         client: SwitchAgentClient,
         triage_agent: TriageAgent,
-        agent_name: str,
+        agent_name: str = "crewpilot-triager",
         github_token: str | None = None,
+        store: TaskStore | None = None,
+        reproducer_agent_name: str = "crewpilot-repro-builder",
     ) -> None:
         self._client = client
         self._agent = triage_agent
         self.agent_name = agent_name
         self._github_token = github_token
+        self._store = store
+        self._reproducer_agent_name = reproducer_agent_name
         self._pending: dict[tuple[str, str | None], PendingTriage] = {}
         self._seen_messages: OrderedDict[str, None] = OrderedDict()
 
@@ -100,35 +114,58 @@ class SwitchTriageConnector:
 
         raw_thread = payload.get("thread_id")
         thread_id = str(raw_thread) if raw_thread else None
-        sender_id = str(payload.get("sender") or sender_name)
+        sender = payload.get("sender")
+        if isinstance(sender, dict):
+            sender_id = str(sender.get("id") or sender.get("name") or sender_name)
+            sender_name = str(sender.get("name") or sender.get("username") or sender_name)
+        elif isinstance(sender, str) and sender.strip():
+            sender_id = sender.strip()
+        else:
+            sender_id = str(payload.get("sender_id") or sender_name)
         normalized = self._normalize(body)
 
         if HELP_RE.fullmatch(normalized):
             await self._send(room_id, self._help_text(), thread_id)
             return
 
-        pending_key, pending = self._find_pending(room_id, thread_id)
-        if pending is not None:
-            decision = self._parse_decision(normalized)
-            if decision is not None:
-                await self._handle_decision(
+        # Check for approval or changes decision
+        decision = self._parse_decision(normalized)
+        if decision is not None:
+            verdict, task_id, feedback = decision
+            if self._store is not None:
+                await self._handle_store_decision(
+                    room_id=room_id,
+                    thread_id=thread_id,
+                    sender_id=sender_id,
+                    sender_name=sender_name,
+                    task_id=task_id,
+                    verdict=verdict,
+                    feedback=feedback,
+                )
+                return
+
+            # Fallback legacy in-memory handling if store is not configured
+            pending_key, pending = self._find_pending(room_id, thread_id)
+            if pending is not None:
+                await self._handle_legacy_decision(
                     room_id=room_id,
                     thread_id=thread_id,
                     sender_id=sender_id,
                     sender_name=sender_name,
                     pending_key=pending_key,
                     pending=pending,
-                    decision=decision,
+                    verdict=verdict,
+                    feedback=feedback,
                 )
                 return
-        elif self._parse_decision(normalized) is not None:
-            await self._send(
-                room_id,
-                "There is no triage waiting for approval here. "
-                "Mention me with an issue first.",
-                thread_id,
-            )
-            return
+            else:
+                await self._send(
+                    room_id,
+                    "There is no triage waiting for approval here. "
+                    "Mention me with an issue first.",
+                    thread_id,
+                )
+                return
 
         issue_text = self._issue_text(body)
         if not issue_text:
@@ -145,15 +182,33 @@ class SwitchTriageConnector:
             return
 
         request_key = self._request_key(issue_text)
-        duplicate = self._find_pending_for_request(room_id, request_key)
-        if duplicate is not None:
-            await self._send(
-                room_id,
-                f"This issue is already awaiting a decision ({duplicate.source}). "
-                "Approve the existing plan or request changes first.",
-                thread_id,
+
+        # Check for existing duplicate pending requests
+        if self._store is not None:
+            existing_pending = self._store.list_tasks(
+                room_id=room_id,
+                request_key=request_key,
+                status=TaskStatus.AWAITING_APPROVAL.value,
             )
-            return
+            if existing_pending:
+                dup = existing_pending[0]
+                await self._send(
+                    room_id,
+                    f"This issue is already awaiting a decision ({dup.issue_source}, Task: `{dup.task_id}`). "
+                    f"Approve with 'approve {dup.task_id}' or request changes first.",
+                    thread_id,
+                )
+                return
+        else:
+            duplicate = self._find_pending_for_request(room_id, request_key)
+            if duplicate is not None:
+                await self._send(
+                    room_id,
+                    f"This issue is already awaiting a decision ({duplicate.source}). "
+                    "Approve the existing plan or request changes first.",
+                    thread_id,
+                )
+                return
 
         await self._triage(
             room_id=room_id,
@@ -201,10 +256,32 @@ class SwitchTriageConnector:
             )
             return
 
+        task_id: str | None = None
+        if self._store is not None:
+            task = self._store.create_task(
+                room_id=room_id,
+                thread_id=thread_id,
+                requester_id=sender_id,
+                requester_name=sender_name,
+                issue_source=issue.source,
+                request_key=request_key,
+                initial_summary=result.summary,
+                initial_triage_data=result.to_dict(),
+            )
+            task_id = task.task_id
+        else:
+            self._pending[(room_id, thread_id)] = PendingTriage(
+                requester_id=sender_id,
+                requester_name=sender_name,
+                source=issue.source,
+                summary=result.summary,
+                request_key=request_key,
+            )
+
         try:
             await self._client.post_message(
                 room_id,
-                self._format_triage(result, issue.source),
+                self._format_triage(result, issue.source, task_id=task_id),
                 thread_id,
             )
         except SwitchAuthError:
@@ -213,22 +290,126 @@ class SwitchTriageConnector:
             logger.error("Could not post triage result: %s", exc)
             return
 
-        self._pending[(room_id, thread_id)] = PendingTriage(
-            requester_id=sender_id,
-            requester_name=sender_name,
-            source=issue.source,
-            summary=result.summary,
-            request_key=request_key,
-        )
         logger.info(
-            "Posted triage for %s (category=%s severity=%s difficulty=%s)",
+            "Posted triage for %s (task_id=%s category=%s severity=%s difficulty=%s)",
             issue.source,
+            task_id,
             result.category,
             result.severity,
             result.difficulty,
         )
 
-    async def _handle_decision(
+    async def _handle_store_decision(
+        self,
+        *,
+        room_id: str,
+        thread_id: str | None,
+        sender_id: str,
+        sender_name: str,
+        task_id: str | None,
+        verdict: str,
+        feedback: str,
+    ) -> None:
+        """Handle a decision backed by the durable SQLite store."""
+        if not task_id:
+            action_desc = "approve" if verdict == "approve" else "request changes on"
+            await self._send(
+                room_id,
+                f"Please specify the exact task ID to {action_desc}: "
+                f"reply '@{self.agent_name} {verdict} <task-id>'.",
+                thread_id,
+            )
+            return
+
+        assert self._store is not None
+        task = self._store.get_task(task_id)
+        if task is None:
+            await self._send(
+                room_id,
+                f"Task '{task_id}' was not found. Please verify the task ID.",
+                thread_id,
+            )
+            return
+
+        if sender_id != task.requester_id:
+            await self._send(
+                room_id,
+                f"Only {task.requester_name} can approve this triage.",
+                thread_id,
+            )
+            return
+
+        decision_enum = (
+            DecisionType.APPROVED.value
+            if verdict == "approve"
+            else DecisionType.CHANGES_REQUESTED.value
+        )
+
+        try:
+            self._store.record_decision(
+                task_id=task_id,
+                room_id=room_id,
+                thread_id=thread_id,
+                actor_id=sender_id,
+                decision=decision_enum,
+                feedback=feedback if feedback else None,
+            )
+        except TaskNotFoundError:
+            await self._send(
+                room_id,
+                f"Task '{task_id}' was not found. Please verify the task ID.",
+                thread_id,
+            )
+            return
+        except TaskRoomMismatchError:
+            await self._send(
+                room_id,
+                f"Task '{task_id}' belongs to another room.",
+                thread_id,
+            )
+            return
+        except TaskThreadMismatchError:
+            await self._send(
+                room_id,
+                f"Task '{task_id}' must be decided within its original thread.",
+                thread_id,
+            )
+            return
+        except TaskStateError as exc:
+            await self._send(
+                room_id,
+                f"Task '{task_id}' cannot receive a decision: {exc}",
+                thread_id,
+            )
+            return
+        except UnauthorizedActorError:
+            await self._send(
+                room_id,
+                f"Only {task.requester_name} can approve this triage.",
+                thread_id,
+            )
+            return
+
+        if verdict == "approve":
+            message = (
+                f"Approved by {sender_name}. {task.issue_source} (Task `{task_id}`): "
+                f"{_clip(task.issue_source, 300)}\n\n"
+                "Approval recorded in durable SQLite audit log. Dispatching to Reproducer..."
+            )
+            await self._send(room_id, message, thread_id)
+
+            # Send actual Switch handoff message addressed to the Reproducer
+            handoff = f"@{self._reproducer_agent_name} reproduce task {task_id}"
+            await self._send(room_id, handoff, thread_id)
+            logger.info("Dispatched task %s handoff to %s", task_id, self._reproducer_agent_name)
+        else:
+            message = (
+                f"Changes requested by {sender_name} for task `{task_id}` ({task.issue_source}).\n"
+                f"Feedback: {_clip(feedback or 'No feedback supplied.', MAX_ERROR_CHARS)}"
+            )
+            await self._send(room_id, message, thread_id)
+
+    async def _handle_legacy_decision(
         self,
         *,
         room_id: str,
@@ -237,8 +418,10 @@ class SwitchTriageConnector:
         sender_name: str,
         pending_key: tuple[str, str | None] | None,
         pending: PendingTriage,
-        decision: tuple[str, str],
+        verdict: str,
+        feedback: str,
     ) -> None:
+        """Legacy fallback decision handler for unconfigured task store."""
         if sender_id != pending.requester_id:
             await self._send(
                 room_id,
@@ -247,7 +430,6 @@ class SwitchTriageConnector:
             )
             return
 
-        verdict, feedback = decision
         if verdict == "approve":
             message = (
                 f"Approved by {sender_name}. {pending.source}: "
@@ -275,8 +457,7 @@ class SwitchTriageConnector:
         exact = (room_id, thread_id)
         if exact in self._pending:
             return exact, self._pending[exact]
-        # A decision may arrive in a thread (or top level) different from where
-        # the plan was posted; fall back to the room's most recent triage.
+        # Legacy room fallback retained only when TaskStore is not attached
         for key in reversed(self._pending):
             if key[0] == room_id:
                 return key, self._pending[key]
@@ -314,17 +495,38 @@ class SwitchTriageConnector:
         return text
 
     @staticmethod
-    def _parse_decision(normalized: str) -> tuple[str, str] | None:
-        if APPROVE_RE.fullmatch(normalized):
-            return "approve", ""
-        changes = CHANGES_RE.match(normalized)
-        if changes:
-            return "changes", changes.group(1).strip()
+    def _parse_decision(normalized: str) -> tuple[str, str | None, str] | None:
+        """Parse approve or changes command, returning (verdict, task_id, feedback)."""
+        app_match = APPROVE_RE.fullmatch(normalized)
+        if app_match:
+            task_id = app_match.group(1)
+            return "approve", task_id.strip() if task_id else None, ""
+
+        changes_match = CHANGES_RE.match(normalized)
+        if changes_match:
+            task_id = changes_match.group(1)
+            feedback = changes_match.group(2).strip()
+            return "changes", task_id.strip() if task_id else None, feedback
         return None
 
-    def _format_triage(self, result: TriageResult, source: str) -> str:
+    def _format_triage(
+        self, result: TriageResult, source: str, task_id: str | None = None
+    ) -> str:
+        task_line = f"Task ID: `{task_id}`\n" if task_id else ""
+        if task_id:
+            footer = (
+                f"\n\nTo decide, mention me and reply `approve {task_id}` "
+                f"or `changes {task_id} <feedback>`."
+            )
+        else:
+            footer = (
+                "\n\nTo decide, mention me and reply `approve` "
+                "or `changes <feedback>`."
+            )
+
         header = (
             "**Issue triage**\n"
+            f"{task_line}"
             f"Source: {_clip(source, 120)}\n"
             f"Category: {result.category.title()} | "
             f"Severity: {result.severity.title()} | "
@@ -332,10 +534,6 @@ class SwitchTriageConnector:
             "**Summary**\n"
             f"{_clip(result.summary, MAX_SUMMARY_CHARS)}\n\n"
             "**Suggested fix plan**\n"
-        )
-        footer = (
-            "\n\nTo decide, mention me and reply `approve` "
-            "or `changes <feedback>`."
         )
         budget = MAX_MESSAGE_CHARS - len(header) - len(footer)
 
@@ -358,8 +556,8 @@ class SwitchTriageConnector:
             "**CrewPilot Auto-Triager**\n"
             "Mention me with:\n"
             "`triage <GitHub issue URL or description>`\n"
-            "`approve` to accept the latest plan\n"
-            "`changes <feedback>` to request revisions\n"
+            "`approve <task-id>` to accept an investigation plan\n"
+            "`changes <task-id> <feedback>` to request revisions\n"
             "`help` to show this message"
         )
 

@@ -34,14 +34,28 @@ class Settings:
     log_level: str = "INFO"
 
     @classmethod
-    def from_env(cls) -> "Settings":
-        saved = load_saved_credentials()
+    def from_env(
+        cls,
+        agent_name: str | None = None,
+        require_llm: bool = True,
+    ) -> "Settings":
+        if agent_name:
+            saved = load_saved_credentials(agent_name)
+        else:
+            saved = load_saved_credentials()
 
         provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
         if provider not in {"openai", "anthropic", "groq"}:
             raise ConfigError(
                 "LLM_PROVIDER must be 'openai', 'anthropic', or 'groq'."
             )
+
+        resolved_name = (
+            (os.getenv("SWITCH_AGENT_NAME") if not agent_name else None)
+            or saved.get("agent_name")
+            or agent_name
+            or "crewpilot"
+        ).strip()
 
         settings = cls(
             switch_api_url=(
@@ -53,9 +67,7 @@ class Settings:
             switch_api_key=(
                 os.getenv("SWITCH_API_KEY") or saved.get("api_key") or ""
             ).strip(),
-            switch_agent_name=(
-                os.getenv("SWITCH_AGENT_NAME") or saved.get("agent_name") or "crewpilot"
-            ).strip(),
+            switch_agent_name=resolved_name,
             llm_provider=provider,
             openai_api_key=os.getenv("OPENAI_API_KEY") or None,
             openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
@@ -70,10 +82,10 @@ class Settings:
             github_token=os.getenv("GITHUB_TOKEN") or None,
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
         )
-        settings.validate()
+        settings.validate(require_llm=require_llm)
         return settings
 
-    def validate(self) -> None:
+    def validate(self, require_llm: bool = True) -> None:
         if not self.switch_api_url.startswith(("http://", "https://")):
             raise ConfigError(
                 "SWITCH_API_URL must be the Switch agent bridge/API URL, "
@@ -86,9 +98,10 @@ class Settings:
                 "SWITCH_REGISTRATION_TOKEN set, or provide SWITCH_AGENT_ID and "
                 "SWITCH_API_KEY in .env."
             )
-        if self.llm_provider == "openai" and not self.openai_api_key:
-            raise ConfigError("OPENAI_API_KEY is required when LLM_PROVIDER=openai.")
-        if self.llm_provider == "anthropic" and not self.anthropic_api_key:
-            raise ConfigError("ANTHROPIC_API_KEY is required when LLM_PROVIDER=anthropic.")
-        if self.llm_provider == "groq" and not self.groq_api_key:
-            raise ConfigError("GROQ_API_KEY is required when LLM_PROVIDER=groq.")
+        if require_llm:
+            if self.llm_provider == "openai" and not self.openai_api_key:
+                raise ConfigError("OPENAI_API_KEY is required when LLM_PROVIDER=openai.")
+            if self.llm_provider == "anthropic" and not self.anthropic_api_key:
+                raise ConfigError("ANTHROPIC_API_KEY is required when LLM_PROVIDER=anthropic.")
+            if self.llm_provider == "groq" and not self.groq_api_key:
+                raise ConfigError("GROQ_API_KEY is required when LLM_PROVIDER=groq.")
